@@ -252,7 +252,7 @@ def write_script(path: Path, body: str) -> None:
 # ---- 01 basecall ---------------------------------------------------------
 
 def stage_basecall(cfg: dict, layout: Layout) -> str:
-    name = "01_basecall"
+    name = "s01_basecall"
     mod_models = ",".join(cfg["mod_models"])
     body = sge_header(
         name,
@@ -284,7 +284,7 @@ def stage_basecall(cfg: dict, layout: Layout) -> str:
 # ---- 02 demux ------------------------------------------------------------
 
 def stage_demux(cfg: dict, layout: Layout, hold: str) -> str:
-    name = "02_demux"
+    name = "s02_demux"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -325,7 +325,7 @@ def stage_rename(
     (e.g. <prefix>_barcode01.fastq). We rglob for files matching each
     barcode and concatenate into <sample>.fastq.
     """
-    name = "03_rename"
+    name = "s03_rename"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -372,7 +372,7 @@ def stage_rename(
 def stage_filter(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "04_filter"
+    name = "s04_filter"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -409,7 +409,7 @@ def stage_filter(
 def stage_subsample(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "05_subsample"
+    name = "s05_subsample"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -472,7 +472,7 @@ def stage_assemble(
     batches = [commands[i : i + jobs_per] for i in range(0, len(commands), jobs_per)]
     names: List[str] = []
     for i, batch in enumerate(batches, start=1):
-        name = f"06_assemble_batch_{i:03d}"
+        name = f"s06_assemble_batch_{i:03d}"
         body = sge_header(
             name,
             layout.stdout_dir,
@@ -497,7 +497,7 @@ def stage_organize(cfg: dict, layout: Layout, hold: str) -> str:
     """Group flat assembly fastas into per-sample subdirs by the first
     three underscore-delimited tokens of the filename.
     """
-    name = "07_organize"
+    name = "s07_organize"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -559,7 +559,7 @@ def stage_organize(cfg: dict, layout: Layout, hold: str) -> str:
 def stage_compress(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "08_compress"
+    name = "s08_compress"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -591,7 +591,7 @@ def stage_compress(
 def stage_cluster(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "09_cluster"
+    name = "s09_cluster"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -626,7 +626,7 @@ def stage_cluster(
 # ---- 10 trim + resolve --------------------------------------------------
 
 def stage_trim_resolve(cfg: dict, layout: Layout, hold: str) -> str:
-    name = "10_trim_resolve"
+    name = "s10_trim_resolve"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -669,7 +669,7 @@ def stage_trim_resolve(cfg: dict, layout: Layout, hold: str) -> str:
 def stage_combine(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "11_combine"
+    name = "s11_combine"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -704,7 +704,7 @@ def stage_combine(
 def stage_collect(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "12_collect"
+    name = "s12_collect"
     body = sge_header(
         name,
         layout.stdout_dir,
@@ -749,7 +749,7 @@ def stage_collect(
 def stage_annotate(
     cfg: dict, layout: Layout, samples: List[Sample], hold: str
 ) -> str:
-    name = "13_annotate"
+    name = "s13_annotate"
     body = sge_header(
         name,
         layout.stdout_dir,

@@ -1,0 +1,8 @@
+barcode	sample	genome_length	genus	species	strain	kingdom	reference_proteins
+barcode01	G0224_i1	1832625	Methanobrevibacter	smithii	G0224_i1	Archaea	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/msmithii.gbk
+barcode02	V123_i2	1800000	Methanobrevibacter	smithii	V123_i2	Archaea	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/msmithii.gbk
+barcode03	Mmillerae	1862675	Methanobrevibacter	millerae	Mmillerae	Archaea	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/mmillerae.gbk
+barcode04	Mmobile	1862675	Methanomicrobium	mobile	Mmobile	Archaea	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/mmobile.gbk
+barcode05	Ec_SCS110_V3_KS2	4751854	Escherichia	coli	Ec_SCS110_V3_KS2	Bacteria	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/ecoli.gbk
+barcode06	Ec_SCS110_V3_pTH	4751854	Escherichia	coli	Ec_SCS110_V3_pTH	Bacteria	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/ecoli.gbk
+barcode07	Ec_SCS110_V3_R6K	4751854	Escherichia	coli	Ec_SCS110_V3_R6K	Bacteria	/ebio/abt3_scratch/jmarsh/nanopore/2026_library/prokka/refs/ecoli.gbk

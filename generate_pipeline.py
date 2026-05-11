@@ -6,8 +6,10 @@ pipeline as a stack of SGE submit scripts wired together with -hold_jid.
 Inputs
 ------
   --pod5-dir      Folder of *.pod5 files (raw signal data)
-  --samplesheet   TSV: barcode, sample, genome_length, genus, species,
-                  strain, kingdom, reference_proteins
+  --samplesheet   TSV with required columns: barcode, sample, genome_length,
+                  genus, species, strain. Optional columns (any may be
+                  absent): kingdom, reference_proteins, gram (pos/neg/unknown),
+                  plasmid (name).
   --output-dir    Where everything (intermediate + final) gets written
   --config        YAML config (see pipeline_config.yaml)
 
@@ -78,9 +80,14 @@ REQUIRED_COLS = [
     "genus",
     "species",
     "strain",
-    "kingdom",
-    "reference_proteins",
 ]
+OPTIONAL_COLS = [
+    "kingdom",             # not used by bakta; kept for samplesheet back-compat
+    "reference_proteins",  # bakta --proteins <path>
+    "gram",                # bakta --gram + / - / ?  (pos / neg / unknown)
+    "plasmid",             # bakta --plasmid <name>
+]
+GRAM_MAP = {"pos": "+", "neg": "-", "unknown": "?"}
 
 
 @dataclass
@@ -91,22 +98,27 @@ class Sample:
     genus: str
     species: str
     strain: str
-    kingdom: str
-    reference_proteins: str  # may be empty -> prokka without --proteins
+    kingdom: str = ""
+    reference_proteins: str = ""  # empty -> no --proteins flag
+    gram: str = ""                # empty -> no --gram flag
+    plasmid: str = ""             # empty -> no --plasmid flag
 
 
 def parse_samplesheet(path: Path) -> List[Sample]:
     with path.open() as fh:
         reader = csv.DictReader(fh, delimiter="\t")
-        missing = [c for c in REQUIRED_COLS if c not in (reader.fieldnames or [])]
+        cols = reader.fieldnames or []
+        missing = [c for c in REQUIRED_COLS if c not in cols]
         if missing:
             raise SystemExit(
                 f"Samplesheet {path} missing required columns: {missing}\n"
-                f"Required: {REQUIRED_COLS}"
+                f"Required: {REQUIRED_COLS}\n"
+                f"Optional: {OPTIONAL_COLS}"
             )
         samples: List[Sample] = []
         for row_num, row in enumerate(reader, start=2):
-            if not any((row.get(c) or "").strip() for c in REQUIRED_COLS):
+            present_cols = REQUIRED_COLS + [c for c in OPTIONAL_COLS if c in cols]
+            if not any((row.get(c) or "").strip() for c in present_cols):
                 continue
             try:
                 gl = int((row["genome_length"] or "").replace(",", "").strip())
@@ -114,6 +126,12 @@ def parse_samplesheet(path: Path) -> List[Sample]:
                 raise SystemExit(
                     f"Row {row_num}: genome_length is not an integer "
                     f"({row['genome_length']!r})"
+                )
+            gram = (row.get("gram") or "").strip().lower()
+            if gram and gram not in GRAM_MAP:
+                raise SystemExit(
+                    f"Row {row_num}: gram must be one of {list(GRAM_MAP)} "
+                    f"(got {gram!r})"
                 )
             samples.append(
                 Sample(
@@ -123,8 +141,10 @@ def parse_samplesheet(path: Path) -> List[Sample]:
                     genus=row["genus"].strip(),
                     species=row["species"].strip(),
                     strain=row["strain"].strip(),
-                    kingdom=row["kingdom"].strip(),
+                    kingdom=(row.get("kingdom") or "").strip(),
                     reference_proteins=(row.get("reference_proteins") or "").strip(),
+                    gram=gram,
+                    plasmid=(row.get("plasmid") or "").strip(),
                 )
             )
     if not samples:
@@ -285,7 +305,7 @@ class Layout:
     assemblies_fasta: Path
     cluster_dir: Path
     consensus: Path
-    prokka: Path
+    annotate: Path
     submit_dir: Path
     stdout_dir: Path
 
@@ -304,7 +324,7 @@ class Layout:
             assemblies_fasta=root / "autocycler" / "assemblies_fasta",
             cluster_dir=root / "autocycler" / "cluster",
             consensus=root / "consensus",
-            prokka=root / "prokka",
+            annotate=root / "bakta",
             submit_dir=root / "submit_scripts",
             stdout_dir=root / "stdout",
         )
@@ -986,41 +1006,56 @@ def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
         name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
         cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
     )
-    body += conda_block(cfg["conda_env_prokka"]) + "\n\n"
+    body += conda_block(cfg["conda_env_bakta"]) + "\n\n"
     body += log_setup(name, layout) + "\n\n"
-    body += f"mkdir -p {layout.prokka}\n\n"
+    body += f"mkdir -p {layout.annotate}\n\n"
+    bakta_min_len = int(cfg.get("bakta_min_contig_length", 200))
+    bakta_threads = int(cfg.get("bakta_threads", 20))
     for s in samples:
-        proteins = f"--proteins {s.reference_proteins}" if s.reference_proteins else ""
-        out_dir = f"{layout.prokka}/{s.sample}"
-        marker = f"{out_dir}/{s.sample}.gff"
+        # Build optional flags conditionally so they're only present when
+        # the samplesheet supplied a value. Each flag is on its own line with
+        # the same continuation indentation as the other bakta flags so the
+        # generated script reads cleanly.
+        opt_flags: List[str] = []
+        if s.plasmid:
+            opt_flags.append(f"--plasmid {s.plasmid}")
+        if s.gram:
+            opt_flags.append(f"--gram {GRAM_MAP[s.gram]}")
+        if s.reference_proteins:
+            opt_flags.append(f"--proteins {s.reference_proteins}")
+        # Indented to match the other --flag lines after textwrap.dedent
+        # strips the common leading whitespace.
+        opt_lines = "".join(f"        {flag} \\\n" for flag in opt_flags)
+
+        out_dir = f"{layout.annotate}/{s.sample}"
+        marker = f"{out_dir}/{s.sample}.gff3"
         body += textwrap.dedent(
-            f"""
+            f"""\
             if [ -s {marker} ]; then
-                log_event SKIP "{s.sample} (prokka .gff exists)"
+                log_event SKIP "{s.sample} (bakta .gff3 exists)"
             elif [ ! -s {layout.consensus}/{s.sample}.fasta ]; then
                 log_event WARN "{s.sample}: consensus fasta missing"
                 STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
             else
-                # prokka refuses to overwrite an existing --outdir
-                rm -rf {out_dir}
                 set +e
-                prokka --dbdir {cfg['prokka_db_dir']} \\
-                    --outdir {out_dir} \\
+                bakta \\
+                    --db {cfg['bakta_db']} \\
+                    --min-contig-length {bakta_min_len} \\
                     --prefix {s.sample} \\
-                    --locustag {s.sample} \\
+                    --output {out_dir} \\
                     --genus {s.genus} \\
                     --species {s.species} \\
                     --strain {s.strain} \\
-                    --kingdom {s.kingdom} \\
-                    {proteins} \\
-                    --cdsrnaolap \\
-                    --cpus {cfg['prokka_threads']} \\
-                    --rfam \\
+            """
+        ) + opt_lines + textwrap.dedent(
+            f"""\
+                    --threads {bakta_threads} \\
+                    --force \\
                     {layout.consensus}/{s.sample}.fasta
                 rc=$?
                 set -e
                 if [ $rc -ne 0 ]; then
-                    log_event WARN "{s.sample}: prokka rc=$rc"
+                    log_event WARN "{s.sample}: bakta rc=$rc"
                     STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                 else
                     log_event OK "{s.sample} annotated"
@@ -1157,7 +1192,7 @@ def main() -> None:
         layout.basecalled, layout.fastq_raw, layout.fastq,
         layout.fastq_filtered, layout.autocycler, layout.assemblies_flat,
         layout.assemblies_fasta, layout.cluster_dir, layout.consensus,
-        layout.prokka,
+        layout.annotate,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 

@@ -22,7 +22,8 @@ conda_env_basecall: nanopore
 conda_env_demux: nanopore
 conda_env_chopper: nanopore
 conda_env_autocycler: autocycler
-conda_env_prokka: prokka
+# Bakta is installed in the env called 'prokka' on this cluster.
+conda_env_bakta: prokka
 
 # ---------- Chopper QC ----------
 chopper_quality: 10
@@ -51,9 +52,10 @@ min_contig_length: 1000
 # (the autocycler default) so older versions without the flag still work.
 max_contigs: 25
 
-# ---------- Prokka ----------
-prokka_db_dir: /ebio/abt3_scratch/jmarsh/tract_score3/prokka/prokka_db/db
-prokka_threads: 20
+# ---------- Bakta ----------
+bakta_db: /ebio/abt3_scratch/jmarsh/bakta/db/db
+bakta_min_contig_length: 200
+bakta_threads: 20
 
 # ---------- SGE ----------
 email: james.marsh@tuebingen.mpg.de

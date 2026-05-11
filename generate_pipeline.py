@@ -30,7 +30,8 @@ Stages (each emits one SGE script unless noted)
   s10_trim_resolve   autocycler trim + resolve on every cluster_*
   s11_combine        autocycler combine per sample
   s12_collect        gather consensus_assembly.fasta -> consensus/<sample>.fasta
-  s13_annotate       prokka per sample using samplesheet metadata
+  s13_annotate       Bakta per sample using samplesheet metadata
+  s14_classify       GTDB-Tk classify_wf across all Bakta .fna outputs
 
 Logging + resume
 ----------------
@@ -89,6 +90,13 @@ OPTIONAL_COLS = [
 ]
 GRAM_MAP = {"pos": "+", "neg": "-", "unknown": "?"}
 
+# Bakta requires plasmid names to start with a lowercase 'p' and be INSDC-
+# compliant (alphanumeric + dot/dash/underscore, max length ~24). This catches
+# the most common mistake (using a sample name as the plasmid name) at parse
+# time instead of mid-run.
+import re as _re
+PLASMID_RE = _re.compile(r"^p[a-zA-Z0-9._-]{0,23}$")
+
 
 @dataclass
 class Sample:
@@ -133,6 +141,15 @@ def parse_samplesheet(path: Path) -> List[Sample]:
                     f"Row {row_num}: gram must be one of {list(GRAM_MAP)} "
                     f"(got {gram!r})"
                 )
+            plasmid = (row.get("plasmid") or "").strip()
+            if plasmid and not PLASMID_RE.match(plasmid):
+                raise SystemExit(
+                    f"Row {row_num}: plasmid name {plasmid!r} is not Bakta-compatible.\n"
+                    f"Bakta requires the name to start with a lowercase 'p' and "
+                    f"contain only alphanumerics, dots, dashes, or underscores "
+                    f"(max 24 chars). Example: pTp114_TS_ori, pUC19, pV3_KS2.\n"
+                    f"Leave the column blank for samples that don't have a plasmid."
+                )
             samples.append(
                 Sample(
                     barcode=row["barcode"].strip(),
@@ -144,7 +161,7 @@ def parse_samplesheet(path: Path) -> List[Sample]:
                     kingdom=(row.get("kingdom") or "").strip(),
                     reference_proteins=(row.get("reference_proteins") or "").strip(),
                     gram=gram,
-                    plasmid=(row.get("plasmid") or "").strip(),
+                    plasmid=plasmid,
                 )
             )
     if not samples:
@@ -306,6 +323,7 @@ class Layout:
     cluster_dir: Path
     consensus: Path
     annotate: Path
+    gtdbtk: Path
     submit_dir: Path
     stdout_dir: Path
 
@@ -325,6 +343,7 @@ class Layout:
             cluster_dir=root / "autocycler" / "cluster",
             consensus=root / "consensus",
             annotate=root / "bakta",
+            gtdbtk=root / "gtdbtk",
             submit_dir=root / "submit_scripts",
             stdout_dir=root / "stdout",
         )
@@ -1073,13 +1092,95 @@ def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
             """
         )
     body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
-    body += '\n# Final pipeline summary\n'
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s14 GTDB-Tk classification -----------------------------------------
+
+def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    name = "s14_classify"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"],
+        cfg.get("sge_h_vmem_gtdbtk", "100G"),
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_gtdbtk"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+
+    ext = cfg.get("gtdbtk_extension", "fna")
+    cpus = int(cfg.get("gtdbtk_cpus", 20))
+    pplacer_cpus = int(cfg.get("gtdbtk_pplacer_cpus", 12))
+    data_path = cfg.get("gtdbtk_data_path", "") or ""
+
+    out_dir = f"{layout.gtdbtk}/output"
+    batchfile = f"{layout.gtdbtk}/batchfile.tsv"
+
+    body += f"mkdir -p {layout.gtdbtk}\n"
+    if data_path:
+        body += f'export GTDBTK_DATA_PATH="{data_path}"\n'
     body += textwrap.dedent(
         f"""
+
+        # Build the GTDB-Tk batchfile from Bakta's .fna outputs.
+        # Format: <fasta_path>\\t<genome_id>
+        # Only samples that successfully annotated (their .{ext} exists) are included.
+        : > {batchfile}
+        """
+    )
+    for s in samples:
+        fna = f"{layout.annotate}/{s.sample}/{s.sample}.{ext}"
+        body += textwrap.dedent(
+            f"""
+            if [ -s {fna} ]; then
+                printf '%s\\t%s\\n' '{fna}' '{s.sample}' >> {batchfile}
+            else
+                log_event WARN "{s.sample}: missing bakta output ({fna}), excluded from GTDB-Tk run"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            fi
+            """
+        )
+    body += textwrap.dedent(
+        f"""
+
+        n_entries=$(wc -l < {batchfile})
+        log_event OK "GTDB-Tk batchfile has $n_entries entries"
+        if [ "$n_entries" -eq 0 ]; then
+            log_event WARN "no Bakta outputs found, skipping GTDB-Tk entirely"
+            exit 0
+        fi
+
+        # Resume check: GTDB-Tk writes gtdbtk.bac120.summary.tsv and/or
+        # gtdbtk.ar53.summary.tsv at the very end. If either exists, skip.
+        if compgen -G "{out_dir}/gtdbtk.*.summary.tsv" > /dev/null; then
+            log_event SKIP "GTDB-Tk summary already present in {out_dir}"
+        else
+            mkdir -p {out_dir}
+            set +e
+            gtdbtk classify_wf \\
+                --batchfile {batchfile} \\
+                --out_dir {out_dir} \\
+                --extension {ext} \\
+                --cpus {cpus} \\
+                --pplacer_cpus {pplacer_cpus}
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+                log_event WARN "gtdbtk classify_wf rc=$rc"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                summary_files=$(ls {out_dir}/gtdbtk.*.summary.tsv 2>/dev/null)
+                log_event OK "GTDB-Tk classification complete (summaries: $summary_files)"
+            fi
+        fi
+
+        log_warn_errors_from "$STAGE_LOG"
+
         log_event SUMMARY "pipeline finished — log at $PIPELINE_LOG"
         echo "" >> $PIPELINE_LOG
         echo "==================== pipeline summary ====================" >> $PIPELINE_LOG
-        grep -E '\\[(START|DONE|FAIL)\\]' $PIPELINE_LOG | tail -200 >> $PIPELINE_LOG
+        grep -aE '\\[(START|DONE|FAIL)\\]' $PIPELINE_LOG | tail -200 >> $PIPELINE_LOG
         echo "==========================================================" >> $PIPELINE_LOG
         """
     )
@@ -1200,7 +1301,7 @@ def main() -> None:
         layout.basecalled, layout.fastq_raw, layout.fastq,
         layout.fastq_filtered, layout.autocycler, layout.assemblies_flat,
         layout.assemblies_fasta, layout.cluster_dir, layout.consensus,
-        layout.annotate,
+        layout.annotate, layout.gtdbtk,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -1221,11 +1322,12 @@ def main() -> None:
     n11 = stage_combine(cfg, layout, samples, hold=n10)
     n12 = stage_collect(cfg, layout, samples, hold=n11)
     n13 = stage_annotate(cfg, layout, samples, hold=n12)
+    n14 = stage_classify(cfg, layout, samples, hold=n13)
 
     ordered = [
         [n01], [n02], [n03], [n04], [n05],
         n06_list,
-        [n07], [n08], [n09], [n10], [n11], [n12], [n13],
+        [n07], [n08], [n09], [n10], [n11], [n12], [n13], [n14],
     ]
     write_submit_all(layout, ordered)
     write_pipeline_status(layout)

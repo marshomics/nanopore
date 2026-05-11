@@ -786,12 +786,12 @@ def stage_compress(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
         extra = f" --max_contigs {int(cfg['max_contigs'])}"
     for s in samples:
         sample_dir = f"{layout.autocycler}/{s.sample}"
-        # autocycler compress writes input_assemblies.fasta into the autocycler dir
-        marker = f"{sample_dir}/input_assemblies.fasta"
+        # autocycler compress writes input_assemblies.gfa into the autocycler dir
+        marker = f"{sample_dir}/input_assemblies.gfa"
         body += textwrap.dedent(
             f"""
             if [ -s {marker} ]; then
-                log_event SKIP "{s.sample} (input_assemblies.fasta exists)"
+                log_event SKIP "{s.sample} (input_assemblies.gfa exists)"
             else
                 set +e
                 autocycler compress \\
@@ -834,8 +834,8 @@ def stage_cluster(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -
             f"""
             if [ -d {marker} ]; then
                 log_event SKIP "{s.sample} (clustering/ exists)"
-            elif [ ! -s {ac_dir}/input_assemblies.fasta ]; then
-                log_event WARN "{s.sample}: compress output missing, skipping"
+            elif [ ! -s {ac_dir}/input_assemblies.gfa ]; then
+                log_event WARN "{s.sample}: compress output (input_assemblies.gfa) missing, skipping"
                 STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
             else
                 set +e

@@ -1,7 +1,7 @@
 # Nanopore assembly + annotation pipeline
 
 End-to-end SGE pipeline that takes raw POD5 files and a sample sheet, runs
-basecalling → demux → QC → Autocycler 8-assembler consensus → Prokka, and
+basecalling → demux → QC → Autocycler 8-assembler consensus → Bakta, and
 ends with one annotated assembly per sample.
 
 ## Files
@@ -14,16 +14,25 @@ ends with one annotated assembly per sample.
 
 TSV with these columns (header required, order doesn't matter):
 
+**Required:**
+
 | column              | meaning                                              |
 |---------------------|------------------------------------------------------|
 | `barcode`           | dorado demux barcode tag, e.g. `barcode01`           |
 | `sample`            | output prefix; must be unique                        |
 | `genome_length`     | expected genome size in bp (integer; commas allowed) |
-| `genus`             | Prokka `--genus`                                     |
-| `species`           | Prokka `--species`                                   |
-| `strain`            | Prokka `--strain` (and `--prefix` / `--locustag`)    |
-| `kingdom`           | `Bacteria` or `Archaea`                              |
-| `reference_proteins`| path to a `.gbk`; leave blank to skip `--proteins`   |
+| `genus`             | Bakta `--genus`                                      |
+| `species`           | Bakta `--species`                                    |
+| `strain`            | Bakta `--strain` (also used as `--prefix`)           |
+
+**Optional** (any of these may be absent from the header, or left blank per row):
+
+| column              | meaning                                                            |
+|---------------------|--------------------------------------------------------------------|
+| `kingdom`           | not used by Bakta; kept for back-compat with old samplesheets       |
+| `reference_proteins`| path to a `.gbk` reference; emits `--proteins <path>` when present |
+| `gram`              | `pos` / `neg` / `unknown` — maps to Bakta `--gram +/-/?`           |
+| `plasmid`           | plasmid name — emits `--plasmid <name>` when present               |
 
 ## Running
 
@@ -92,7 +101,7 @@ What each stage looks at to decide whether to skip:
 | `s10_trim_resolve`| `cluster_*/5_final.gfa` exists (resolve); trimmed marker (trim)                 |
 | `s11_combine`     | `autocycler/<sample>/consensus_assembly.fasta` exists                           |
 | `s12_collect`     | `consensus/<sample>.fasta` exists                                               |
-| `s13_annotate`    | `prokka/<sample>/<sample>.gff` exists                                           |
+| `s13_annotate`    | `bakta/<sample>/<sample>.gff3` exists                                           |
 
 To **force** re-run for one sample, delete its output for the stage you
 want to redo. For example, to retry compress + everything downstream for
@@ -146,7 +155,7 @@ to apply a stricter threshold to already-filtered samples, delete the
 ├── autocycler/assemblies_fasta/   # s07_organize (per-sample, length-filtered)
 ├── autocycler/cluster/<sample>/   # s09_cluster (symlink)
 ├── consensus/<sample>.fasta       # s12_collect
-├── prokka/<sample>/               # s13_annotate
+├── bakta/<sample>/                # s13_annotate (Bakta output)
 ├── submit_scripts/                # generated SGE scripts
 ├── stdout/                        # SGE per-stage stdout
 └── submit_all.sh
@@ -167,14 +176,15 @@ s01_basecall (GPU)
                                   └─ s10_trim_resolve
                                       └─ s11_combine
                                           └─ s12_collect
-                                              └─ s13_annotate (Prokka)
+                                              └─ s13_annotate (Bakta)
 ```
 
 ## Assumptions
 
 - The conda envs named in `pipeline_config.yaml` exist and contain the
   expected tools: `nanopore` → dorado + chopper, `autocycler` → autocycler
-  plus every assembler in `assemblers:`, `prokka` → prokka.
+  plus every assembler in `assemblers:`, and the env named in
+  `conda_env_bakta` (default `prokka`) has Bakta installed.
 - Dorado demux output filenames contain the barcode label. The `s03_rename`
   step matches `*<barcode>*.fastq[.gz]`.
 - Autocycler subsample produces 4 subsamples named `sample_01.fastq` …

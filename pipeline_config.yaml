@@ -42,6 +42,15 @@ threads_per_assembler: 16
 threads_necat: 4               # necat hard-caps lower than the others
 jobs_per_assembly_batch: 4     # how many helper commands per SGE job
 
+# Drop contigs below this length (bp) from each assembly before compress.
+# Set to 0 to disable. Fragmented assemblies (miniasm/raven on noisy reads)
+# routinely blow past compress's contigs-per-input threshold without this.
+min_contig_length: 1000
+
+# autocycler compress --max_contigs threshold. Only emitted when != 25
+# (the autocycler default) so older versions without the flag still work.
+max_contigs: 25
+
 # ---------- Prokka ----------
 prokka_db_dir: /ebio/abt3_scratch/jmarsh/tract_score3/prokka/prokka_db/db
 prokka_threads: 20

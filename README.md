@@ -1,8 +1,9 @@
 # Nanopore assembly + annotation pipeline
 
 End-to-end SGE pipeline that takes raw POD5 files and a sample sheet, runs
-basecalling → demux → QC → Autocycler 8-assembler consensus → Bakta, and
-ends with one annotated assembly per sample.
+basecalling → demux → QC → Autocycler 8-assembler consensus → Bakta →
+GTDB-Tk, and ends with one annotated, taxonomically classified assembly
+per sample.
 
 ## Files
 
@@ -102,6 +103,7 @@ What each stage looks at to decide whether to skip:
 | `s11_combine`     | `autocycler/<sample>/consensus_assembly.fasta` exists                           |
 | `s12_collect`     | `consensus/<sample>.fasta` exists                                               |
 | `s13_annotate`    | `bakta/<sample>/<sample>.gff3` exists                                           |
+| `s14_classify`    | any `gtdbtk/output/gtdbtk.*.summary.tsv` exists                                 |
 
 To **force** re-run for one sample, delete its output for the stage you
 want to redo. For example, to retry compress + everything downstream for
@@ -156,6 +158,9 @@ to apply a stricter threshold to already-filtered samples, delete the
 ├── autocycler/cluster/<sample>/   # s09_cluster (symlink)
 ├── consensus/<sample>.fasta       # s12_collect
 ├── bakta/<sample>/                # s13_annotate (Bakta output)
+├── gtdbtk/
+│   ├── batchfile.tsv              # auto-generated from successful Bakta outputs
+│   └── output/                    # gtdbtk.bac120.summary.tsv, ar53, classify/, etc.
 ├── submit_scripts/                # generated SGE scripts
 ├── stdout/                        # SGE per-stage stdout
 └── submit_all.sh
@@ -177,14 +182,17 @@ s01_basecall (GPU)
                                       └─ s11_combine
                                           └─ s12_collect
                                               └─ s13_annotate (Bakta)
+                                              └─ s14_classify (GTDB-Tk)
 ```
 
 ## Assumptions
 
 - The conda envs named in `pipeline_config.yaml` exist and contain the
   expected tools: `nanopore` → dorado + chopper, `autocycler` → autocycler
-  plus every assembler in `assemblers:`, and the env named in
-  `conda_env_bakta` (default `prokka`) has Bakta installed.
+  plus every assembler in `assemblers:`, the env named in
+  `conda_env_bakta` (default `prokka`) has Bakta installed, and the env
+  named in `conda_env_gtdbtk` (default `gtdbtk3`) has GTDB-Tk plus a
+  working `GTDBTK_DATA_PATH` (or supply `gtdbtk_data_path:` in the config).
 - Dorado demux output filenames contain the barcode label. The `s03_rename`
   step matches `*<barcode>*.fastq[.gz]`.
 - Autocycler subsample produces 4 subsamples named `sample_01.fastq` …

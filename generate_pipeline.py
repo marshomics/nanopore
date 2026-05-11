@@ -600,8 +600,8 @@ def stage_assemble(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
         for out_prefix, cmd, label in batch:
             body += textwrap.dedent(
                 f"""
-                if [ -s {out_prefix}.fasta ]; then
-                    log_event SKIP "{label} ({out_prefix}.fasta exists)"
+                if [ -s {out_prefix}.fasta ] || [ -f {out_prefix}.done ]; then
+                    log_event SKIP "{label} (already complete)"
                 else
                     log_event OK "{label} starting"
                     set +e
@@ -614,9 +614,14 @@ def stage_assemble(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
                     elif [ ! -s {out_prefix}.fasta ]; then
                         # rc=0 + no output usually means the assembler ran fine
                         # but found nothing to assemble — typical for plassembler
-                        # on samples with no plasmids. Not a failure.
+                        # on samples with no plasmids. Not a failure. Touch a
+                        # .done sentinel so future restarts don't re-run it.
+                        touch {out_prefix}.done
                         log_event INFO "{label} completed with no output (e.g. plassembler with no plasmids)"
                     else
+                        # Also drop a .done marker for samples that did produce
+                        # output, so the SKIP check on resume is uniform.
+                        touch {out_prefix}.done
                         log_event OK "{label} done"
                     fi
                 fi
@@ -871,7 +876,10 @@ def stage_trim_resolve(cfg: dict, layout: Layout, hold: str) -> str:
     body += log_setup(name, layout) + "\n\n"
     body += textwrap.dedent(
         f"""
-        find {layout.cluster_dir} -type d -path "*/clustering/qc_pass" | while read qc_dir; do
+        # Search the real autocycler dir, not the cluster/ symlink. find
+        # without -L doesn't traverse symlinks, so searching through
+        # cluster/<sample>/clustering (a symlink) would never see qc_pass.
+        find {layout.autocycler} -type d -path "*/clustering/qc_pass" -not -path "*/cluster/*" | while read qc_dir; do
             for c in "$qc_dir"/cluster_*; do
                 [ -d "$c" ] || continue
                 if [ -f "$c/2_trimmed.gfa" ] || [ -f "$c/3_trimmed.gfa" ] || [ -f "$c/trimmed.gfa" ]; then
@@ -891,7 +899,7 @@ def stage_trim_resolve(cfg: dict, layout: Layout, hold: str) -> str:
             done
         done
 
-        find {layout.cluster_dir} -type d -path "*/clustering/qc_pass" | while read qc_dir; do
+        find {layout.autocycler} -type d -path "*/clustering/qc_pass" -not -path "*/cluster/*" | while read qc_dir; do
             for c in "$qc_dir"/cluster_*; do
                 [ -d "$c" ] || continue
                 if [ -f "$c/5_final.gfa" ]; then

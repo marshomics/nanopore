@@ -229,8 +229,23 @@ def log_setup(name: str, layout: "Layout") -> str:
         log_warn_errors_from() {{
             local f="$1"
             [ -f "$f" ] || return 0
-            grep -niE 'error|warn|fail|traceback' "$f" 2>/dev/null \\
-                | head -50 \\
+            # Only match definitive error markers. We drop Traceback because
+            # Python-based assemblers (nextDenovo especially) emit tracebacks
+            # during normal retry behaviour — real failures still surface as
+            # non-zero return codes, which the per-command wrapper logs as WARN.
+            # Negative filter excludes:
+            #   - canu algorithm names containing "error" (errorRate, error
+            #     detection, error adjustment, error threshold)
+            #   - nextDenovo retry chatter (nextDenovo, cns_align, Re-write
+            #     workdir, empty job, log.critical, .tmpfrunt, sgs_fofn,
+            #     hifi_fofn, Delete task:)
+            #   - plassembler INFO/WARNING noise about canu/unicycler/no plasmids
+            #   - our own log events ([SCAN], [WARN], etc.) to prevent
+            #     feedback loops when stage stderr is captured into stage log
+            grep -nE '(ERROR:|Error:|FATAL:|Fatal:|FAIL:|panic:|Segmentation fault|core dumped|^Killed$)' "$f" 2>/dev/null \\
+                | grep -viE '(error[_ ]?rate|error[_ ]detection|error[_ ]adjustment|error[_ ]threshold|fraction[_ ]error|error[_ ]correction|nextDenovo|cns_align|Re-write workdir|empty job|log\\.critical|\\.tmpfrunt|sgs_fofn|hifi_fofn|Delete task:|plassembler|Unicycler has failed|no plasmids|uncorrected reads|Canu failed to correct|\\[(SCAN|WARN|OK|SKIP|START|DONE|FAIL|INFO|SUMMARY)\\])' \\
+                | head -20 \\
+                | sed -E 's/\\x1B\\[[0-9;]*[mGK]//g' \\
                 | while IFS= read -r line; do
                     log_event SCAN "$line"
                 done
@@ -573,9 +588,14 @@ def stage_assemble(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
                     {cmd}
                     rc=$?
                     set -e
-                    if [ $rc -ne 0 ] || [ ! -s {out_prefix}.fasta ]; then
-                        log_event WARN "{label} rc=$rc (assembler failures are common, continuing)"
+                    if [ $rc -ne 0 ]; then
+                        log_event WARN "{label} assembler exited with code $rc"
                         STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    elif [ ! -s {out_prefix}.fasta ]; then
+                        # rc=0 + no output usually means the assembler ran fine
+                        # but found nothing to assemble — typical for plassembler
+                        # on samples with no plasmids. Not a failure.
+                        log_event INFO "{label} completed with no output (e.g. plassembler with no plasmids)"
                     else
                         log_event OK "{label} done"
                     fi
@@ -599,11 +619,12 @@ def stage_organize(cfg: dict, layout: Layout, hold: str) -> str:
     )
     body += log_setup(name, layout) + "\n\n"
     min_len = int(cfg["min_contig_length"])
+    max_contigs = int(cfg["max_contigs"])
     body += textwrap.dedent(
         f"""
-        log_event OK "organizing and filtering (min_contig_length={min_len})"
+        log_event OK "organizing assemblies (min_contig_length={min_len}, max_contigs_per_assembly={max_contigs})"
         python3 - <<'PYEOF'
-        import os, sys, shutil
+        import sys, shutil
         from collections import defaultdict
         from pathlib import Path
 
@@ -611,11 +632,15 @@ def stage_organize(cfg: dict, layout: Layout, hold: str) -> str:
         dst = Path("{layout.assemblies_fasta}")
         dst.mkdir(parents=True, exist_ok=True)
         MIN_LEN = {min_len}
+        MAX_CONTIGS = {max_contigs}
         PIPELINE_LOG = Path("{layout.root}/pipeline.log")
 
         def log(level, msg):
             import datetime
-            ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            try:
+                ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except AttributeError:
+                ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             line = f"{{ts}} [{{level}}] s07_organize {{msg}}\\n"
             with PIPELINE_LOG.open("a") as fh:
                 fh.write(line)
@@ -624,51 +649,52 @@ def stage_organize(cfg: dict, layout: Layout, hold: str) -> str:
         ASSEMBLERS = {{"canu","flye","metamdbg","miniasm","necat",
                        "nextdenovo","plassembler","raven"}}
 
-        def filter_fasta(in_path: Path, out_path: Path, min_len: int):
-            kept = 0
-            dropped = 0
-            with in_path.open() as fin, out_path.open("w") as fout:
-                header = None
-                seq = []
-                def flush():
-                    nonlocal kept, dropped
-                    if header is None:
-                        return
-                    s = "".join(seq)
-                    if len(s) >= min_len:
-                        fout.write(header + "\\n")
-                        for i in range(0, len(s), 80):
-                            fout.write(s[i:i+80] + "\\n")
-                        kept_local = 1
-                        return 1, 0
-                    else:
-                        return 0, 1
-                for line in fin:
+        def read_fasta(path):
+            \"\"\"Yield (header, sequence) tuples from a fasta file.\"\"\"
+            header = None
+            seq = []
+            with path.open() as fh:
+                for line in fh:
                     line = line.rstrip("\\n")
                     if line.startswith(">"):
                         if header is not None:
-                            s = "".join(seq)
-                            if len(s) >= min_len:
-                                fout.write(header + "\\n")
-                                for i in range(0, len(s), 80):
-                                    fout.write(s[i:i+80] + "\\n")
-                                kept += 1
-                            else:
-                                dropped += 1
+                            yield header, "".join(seq)
                         header = line
                         seq = []
                     else:
                         seq.append(line)
-                if header is not None:
-                    s = "".join(seq)
-                    if len(s) >= min_len:
-                        fout.write(header + "\\n")
-                        for i in range(0, len(s), 80):
-                            fout.write(s[i:i+80] + "\\n")
-                        kept += 1
-                    else:
-                        dropped += 1
-            return kept, dropped
+            if header is not None:
+                yield header, "".join(seq)
+
+        def count_contigs(path):
+            n = 0
+            with path.open() as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        n += 1
+            return n
+
+        def filter_and_cap(in_path, out_path, min_len, max_contigs):
+            \"\"\"Drop contigs shorter than min_len, then keep only the top
+            max_contigs longest remaining contigs. Writes to out_path.\"\"\"
+            kept_short_filter = []
+            dropped_short = 0
+            for header, seq in read_fasta(in_path):
+                if len(seq) >= min_len:
+                    kept_short_filter.append((header, seq))
+                else:
+                    dropped_short += 1
+            # Sort descending by length, take top max_contigs
+            kept_short_filter.sort(key=lambda x: len(x[1]), reverse=True)
+            capped_out = max_contigs > 0 and len(kept_short_filter) > max_contigs
+            final = kept_short_filter[:max_contigs] if max_contigs > 0 else kept_short_filter
+            dropped_cap = len(kept_short_filter) - len(final)
+            with out_path.open("w") as fout:
+                for header, seq in final:
+                    fout.write(header + "\\n")
+                    for i in range(0, len(seq), 80):
+                        fout.write(seq[i:i+80] + "\\n")
+            return len(final), dropped_short, dropped_cap, capped_out
 
         files = list(src.glob("*.fasta"))
         groups = defaultdict(list)
@@ -685,26 +711,35 @@ def stage_organize(cfg: dict, layout: Layout, hold: str) -> str:
             groups[sample].append(f)
 
         total_kept = 0
-        total_dropped = 0
+        total_dropped_short = 0
+        total_dropped_cap = 0
+        capped_count = 0
         for sample, members in groups.items():
             sub = dst / sample
             sub.mkdir(exist_ok=True)
             for f in members:
                 out = sub / f.name
                 if out.exists() and out.stat().st_size > 0:
-                    log("SKIP", f"{{sample}}/{{f.name}} already filtered")
-                    continue
-                if MIN_LEN > 0:
-                    kept, dropped = filter_fasta(f, out, MIN_LEN)
-                    total_kept += kept
-                    total_dropped += dropped
-                    if kept == 0:
-                        log("WARN", f"{{sample}}/{{f.name}} kept 0 contigs (>= {{MIN_LEN}} bp)")
-                else:
-                    shutil.copy2(f, out)
+                    # Skip only if existing output already satisfies the cap.
+                    # If it has more contigs than the cap, re-filter to apply
+                    # the new threshold.
+                    existing = count_contigs(out)
+                    if MAX_CONTIGS <= 0 or existing <= MAX_CONTIGS:
+                        log("SKIP", f"{{sample}}/{{f.name}} already filtered ({{existing}} contigs)")
+                        continue
+                    else:
+                        log("INFO", f"{{sample}}/{{f.name}} has {{existing}} contigs > cap {{MAX_CONTIGS}}, refiltering")
+                kept, ds, dc, capped = filter_and_cap(f, out, MIN_LEN, MAX_CONTIGS)
+                total_kept += kept
+                total_dropped_short += ds
+                total_dropped_cap += dc
+                if capped:
+                    capped_count += 1
+                if kept == 0:
+                    log("WARN", f"{{sample}}/{{f.name}} kept 0 contigs after filter (min_len={{MIN_LEN}})")
             log("OK", f"{{sample}}: {{len(members)}} assemblies organized")
 
-        log("OK", f"contig filter: kept={{total_kept}} dropped={{total_dropped}} (threshold {{MIN_LEN}} bp)")
+        log("OK", f"contig filter: kept={{total_kept}} dropped_short={{total_dropped_short}} dropped_over_cap={{total_dropped_cap}} (capped {{capped_count}} assemblies at {{MAX_CONTIGS}})")
         PYEOF
 
         log_warn_errors_from "$STAGE_LOG"
@@ -1038,6 +1073,58 @@ def write_submit_all(layout: Layout, ordered_jobs: List[List[str]]) -> None:
     out.chmod(out.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def write_pipeline_status(layout: Layout) -> None:
+    """Standalone helper the user can run anytime to see which stages are
+    in-flight, stalled, or done. Diffs START vs DONE events in pipeline.log
+    and reports orphans (started but never finished — could mean still
+    running OR killed by SGE; SIGKILL bypasses the EXIT trap)."""
+    body = textwrap.dedent(
+        f"""
+        #!/bin/bash
+        # pipeline_status.sh — quick check on what each stage is doing.
+        #
+        # Usage:  bash {layout.root}/pipeline_status.sh
+        #
+        # Reads pipeline.log and reports:
+        #   - stages with [START] but no [DONE]     (running or killed)
+        #   - stages with [DONE] but non-zero failures
+        #   - per-level counts
+        LOG="{layout.root}/pipeline.log"
+        if [ ! -f "$LOG" ]; then
+            echo "No pipeline.log at $LOG"
+            exit 1
+        fi
+
+        echo "=== event counts ==="
+        grep -aoE '\\[(START|DONE|FAIL|OK|SKIP|WARN|INFO|SCAN|SUMMARY)\\]' "$LOG" \\
+            | sort | uniq -c | sort -rn
+
+        echo ""
+        echo "=== stages started but not yet DONE ==="
+        comm -23 \\
+            <(grep -aE '\\[START\\]' "$LOG" | awk '{{print $3}}' | sort -u) \\
+            <(grep -aE '\\[DONE\\]'  "$LOG" | awk '{{print $3}}' | sort -u) \\
+            | sed 's/^/  /' || true
+        if [ $? -ne 0 ] || [ -z "$(comm -23 \\
+            <(grep -aE '\\[START\\]' "$LOG" | awk '{{print $3}}' | sort -u) \\
+            <(grep -aE '\\[DONE\\]'  "$LOG" | awk '{{print $3}}' | sort -u))" ]; then
+            echo "  (none)"
+        fi
+
+        echo ""
+        echo "=== stages with per-sample failures ==="
+        grep -aE '\\[DONE\\].*per-sample failures' "$LOG" || echo "  (none)"
+
+        echo ""
+        echo "=== stage-level FAILs ==="
+        grep -aE '\\[FAIL\\]' "$LOG" || echo "  (none)"
+        """
+    ).strip() + "\n"
+    out = layout.root / "pipeline_status.sh"
+    out.write_text(body)
+    out.chmod(out.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1098,10 +1185,12 @@ def main() -> None:
         [n07], [n08], [n09], [n10], [n11], [n12], [n13],
     ]
     write_submit_all(layout, ordered)
+    write_pipeline_status(layout)
 
     print(f"Generated pipeline at: {layout.root}")
     print(f"  - submit_scripts/   ({sum(len(s) for s in ordered)} scripts)")
     print(f"  - submit_all.sh     (driver)")
+    print(f"  - pipeline_status.sh (status check)")
     print(f"  - pipeline.log      (live, one line per event)")
     print(f"  - {len(samples)} sample(s): {[s.sample for s in samples]}")
     print()

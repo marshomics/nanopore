@@ -323,7 +323,12 @@ class Layout:
     cluster_dir: Path
     consensus: Path
     annotate: Path
+    mapping: Path
+    meta_flye: Path
+    bins: Path
+    checkm2: Path
     gtdbtk: Path
+    reports: Path
     submit_dir: Path
     stdout_dir: Path
 
@@ -343,7 +348,12 @@ class Layout:
             cluster_dir=root / "autocycler" / "cluster",
             consensus=root / "consensus",
             annotate=root / "bakta",
+            mapping=root / "mapping",
+            meta_flye=root / "meta_flye",
+            bins=root / "bins",
+            checkm2=root / "checkm2",
             gtdbtk=root / "gtdbtk",
+            reports=root / "reports",
             submit_dir=root / "submit_scripts",
             stdout_dir=root / "stdout",
         )
@@ -1028,7 +1038,7 @@ def stage_collect(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -
 # ---- s13 annotate --------------------------------------------------------
 
 def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
-    name = "s13_annotate"
+    name = "s16_annotate"
     body = sge_header(
         name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
         cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
@@ -1091,16 +1101,301 @@ def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
 
             """
         )
-    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    # Also run Bakta on every MetaBAT2 bin. Bins are putative MAGs of
+    # unknown taxonomy, so we pass only --strain <bin_id> for traceability
+    # and let Bakta annotate without --genus/--species/--proteins/--gram.
+    # Output goes to bakta/<bin_id>/ in parallel with the consensus outputs.
+    body += textwrap.dedent(
+        f"""
+
+        # ---- Bakta on MetaBAT2 bins ----
+        for bin_fa in {layout.bins}/*/*.fa; do
+            [ -e "$bin_fa" ] || continue
+            bin_id=$(basename "$bin_fa" .fa)
+            out_dir={layout.annotate}/${{bin_id}}
+            marker=${{out_dir}}/${{bin_id}}.gff3
+            if [ -s "$marker" ]; then
+                log_event SKIP "${{bin_id}} (bakta .gff3 exists)"
+            else
+                set +e
+                bakta \\
+                    --db {cfg['bakta_db']} \\
+                    --min-contig-length {bakta_min_len} \\
+                    --prefix "$bin_id" \\
+                    --output "$out_dir" \\
+                    --strain "$bin_id" \\
+                    --threads {bakta_threads} \\
+                    --force \\
+                    "$bin_fa"
+                rc=$?
+                set -e
+                if [ $rc -ne 0 ]; then
+                    log_event WARN "$bin_id: bakta rc=$rc"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                else
+                    log_event OK "$bin_id annotated (bin)"
+                fi
+            fi
+        done
+
+        """
+    )
     body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
     write_script(layout.submit_dir / f"{name}.sh", body)
     return name
 
 
-# ---- s14 GTDB-Tk classification -----------------------------------------
+# ---- s13 map reads (minimap2 + samtools) ---------------------------------
+
+def stage_map_reads(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    name = "s13_map_reads"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_mapping"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    threads = int(cfg.get("minimap2_threads", 20))
+    body += f"mkdir -p {layout.mapping}\n\n"
+    for s in samples:
+        sdir = f"{layout.mapping}/{s.sample}"
+        marker = f"{sdir}/flagstat.txt"
+        body += textwrap.dedent(
+            f"""
+            mkdir -p {sdir}
+            if [ -s {marker} ] && [ -s {sdir}/unmapped.fastq ]; then
+                log_event SKIP "{s.sample} (already mapped)"
+            elif [ ! -s {layout.consensus}/{s.sample}.fasta ]; then
+                log_event WARN "{s.sample}: consensus fasta missing, skipping"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            elif [ ! -s {layout.fastq_filtered}/{s.sample}.fastq ]; then
+                log_event WARN "{s.sample}: filtered reads missing, skipping"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                set +e
+                minimap2 -ax map-ont -t {threads} \\
+                    {layout.consensus}/{s.sample}.fasta \\
+                    {layout.fastq_filtered}/{s.sample}.fastq 2>/dev/null \\
+                    | samtools sort -@ {threads} -o {sdir}/mapped.bam -
+                rc=$?
+                if [ $rc -eq 0 ]; then
+                    samtools index {sdir}/mapped.bam
+                    samtools flagstat {sdir}/mapped.bam > {marker}
+                    # Extract unmapped reads as fastq (-f 4 selects unmapped)
+                    samtools fastq -f 4 {sdir}/mapped.bam > {sdir}/unmapped.fastq 2>/dev/null
+                    mapped=$(grep -E '[0-9]+ \\+ [0-9]+ mapped \\(' {marker} | head -1 | awk '{{print $1}}')
+                    total=$(head -1 {marker} | awk '{{print $1}}')
+                    unmapped=$(grep -cE '^@|^>' {sdir}/unmapped.fastq 2>/dev/null || echo 0)
+                    unmapped_reads=$(awk 'NR%4==1' {sdir}/unmapped.fastq | wc -l)
+                    log_event OK "{s.sample} mapped=$mapped/$total unmapped_reads=$unmapped_reads"
+                else
+                    log_event WARN "{s.sample}: minimap2/samtools rc=$rc"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                fi
+                set -e
+            fi
+
+            """
+        )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s15 meta-assemble unmapped reads (Flye --meta) ---------------------
+
+def stage_meta_assemble(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    name = "s14_meta_assemble"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_assembly"], cfg["sge_h_vmem_cpu"],
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_flye_meta"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    threads = int(cfg.get("flye_meta_threads", 20))
+    min_reads = int(cfg.get("flye_meta_min_unmapped_reads", 100))
+    body += f"mkdir -p {layout.meta_flye}\n\n"
+    for s in samples:
+        unmapped = f"{layout.mapping}/{s.sample}/unmapped.fastq"
+        out_dir = f"{layout.meta_flye}/{s.sample}"
+        marker = f"{out_dir}/assembly.fasta"
+        skip_sentinel = f"{out_dir}/.skipped_low_reads"
+        body += textwrap.dedent(
+            f"""
+            if [ -s {marker} ]; then
+                log_event SKIP "{s.sample} (meta assembly exists)"
+            elif [ -f {skip_sentinel} ]; then
+                log_event SKIP "{s.sample} (previously skipped — too few unmapped reads)"
+            elif [ ! -s {unmapped} ]; then
+                log_event INFO "{s.sample}: no unmapped reads, skipping meta-assembly"
+                mkdir -p {out_dir} && touch {skip_sentinel}
+            else
+                n_reads=$(awk 'NR%4==1' {unmapped} | wc -l)
+                if [ "$n_reads" -lt {min_reads} ]; then
+                    log_event INFO "{s.sample}: only $n_reads unmapped reads (< {min_reads}), skipping meta-assembly"
+                    mkdir -p {out_dir} && touch {skip_sentinel}
+                else
+                    log_event OK "{s.sample}: starting flye --meta on $n_reads unmapped reads"
+                    rm -rf {out_dir}
+                    set +e
+                    flye --meta --nano-hq {unmapped} \\
+                        --out-dir {out_dir} \\
+                        --threads {threads}
+                    rc=$?
+                    set -e
+                    if [ $rc -ne 0 ] || [ ! -s {marker} ]; then
+                        log_event WARN "{s.sample}: flye --meta rc=$rc (assembly may be empty)"
+                        STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                        mkdir -p {out_dir} && touch {skip_sentinel}
+                    else
+                        contigs=$(grep -c '^>' {marker})
+                        log_event OK "{s.sample}: flye --meta produced $contigs contigs"
+                    fi
+                fi
+            fi
+
+            """
+        )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s16 MetaBAT2 binning -----------------------------------------------
+
+def stage_bin(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    name = "s15_bin"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_metabat"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    threads = int(cfg.get("minimap2_threads", 20))
+    min_contig = int(cfg.get("metabat_min_contig", 1500))
+    body += f"mkdir -p {layout.bins}\n\n"
+    for s in samples:
+        meta_asm = f"{layout.meta_flye}/{s.sample}/assembly.fasta"
+        bin_dir = f"{layout.bins}/{s.sample}"
+        depth_bam = f"{bin_dir}/depth.bam"
+        depth_txt = f"{bin_dir}/depth.txt"
+        marker_done = f"{bin_dir}/.binning_done"
+        body += textwrap.dedent(
+            f"""
+            mkdir -p {bin_dir}
+            if [ -f {marker_done} ]; then
+                log_event SKIP "{s.sample} (binning previously completed)"
+            elif [ ! -s {meta_asm} ]; then
+                log_event INFO "{s.sample}: no meta-assembly, skipping binning"
+                touch {marker_done}
+            else
+                log_event OK "{s.sample}: mapping unmapped reads to meta-assembly for depth"
+                set +e
+                minimap2 -ax map-ont -t {threads} \\
+                    {meta_asm} \\
+                    {layout.mapping}/{s.sample}/unmapped.fastq 2>/dev/null \\
+                    | samtools sort -@ {threads} -o {depth_bam} -
+                samtools index {depth_bam}
+                jgi_summarize_bam_contig_depths --outputDepth {depth_txt} {depth_bam}
+                metabat2 \\
+                    -i {meta_asm} \\
+                    -a {depth_txt} \\
+                    -o {bin_dir}/{s.sample}_bin \\
+                    -m {min_contig} \\
+                    -t {threads}
+                rc=$?
+                set -e
+                # metabat2 may produce 0 bins (returns 0 in that case)
+                n_bins=$(ls {bin_dir}/{s.sample}_bin.*.fa 2>/dev/null | wc -l)
+                if [ $rc -ne 0 ]; then
+                    log_event WARN "{s.sample}: metabat2 rc=$rc"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                else
+                    log_event OK "{s.sample}: metabat2 produced $n_bins bins"
+                fi
+                touch {marker_done}
+            fi
+
+            """
+        )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s17 CheckM2 quality assessment -------------------------------------
+
+def stage_checkm2(cfg: dict, layout: Layout, hold: str) -> str:
+    name = "s17_checkm2"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_gtdbtk"],
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_checkm2"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    threads = int(cfg.get("checkm2_threads", 20))
+    db = cfg.get("checkm2_db", "") or ""
+    out_dir = f"{layout.checkm2}/output"
+    input_dir = f"{layout.checkm2}/input"
+    marker = f"{out_dir}/quality_report.tsv"
+    if db:
+        body += f'export CHECKM2DB="{db}"\n'
+    body += textwrap.dedent(
+        f"""
+
+        if [ -s {marker} ]; then
+            log_event SKIP "checkm2 quality_report.tsv already exists"
+        else
+            # Stage all assemblies (consensuses + bins) into a flat dir with .fasta extension
+            mkdir -p {input_dir}
+            rm -f {input_dir}/*.fasta
+            # Consensus assemblies from autocycler
+            for f in {layout.consensus}/*.fasta; do
+                [ -e "$f" ] || continue
+                ln -sf "$f" {input_dir}/$(basename "$f")
+            done
+            # MetaBAT2 bins (already include sample name in filename)
+            for f in {layout.bins}/*/*.fa; do
+                [ -e "$f" ] || continue
+                base=$(basename "$f" .fa)
+                ln -sf "$f" {input_dir}/${{base}}.fasta
+            done
+            n_inputs=$(ls {input_dir}/*.fasta 2>/dev/null | wc -l)
+            log_event OK "CheckM2 input: $n_inputs assemblies"
+            if [ "$n_inputs" -eq 0 ]; then
+                log_event WARN "no assemblies found for CheckM2"
+                exit 0
+            fi
+            mkdir -p {out_dir}
+            set +e
+            checkm2 predict \\
+                --threads {threads} \\
+                --input {input_dir} \\
+                --output-directory {out_dir} \\
+                --force \\
+                --extension fasta
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+                log_event WARN "checkm2 predict rc=$rc"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                n_done=$(tail -n +2 {marker} 2>/dev/null | wc -l)
+                log_event OK "CheckM2 finished: $n_done assemblies assessed"
+            fi
+        fi
+
+        log_warn_errors_from "$STAGE_LOG"
+        """
+    ).strip() + "\n"
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s18 GTDB-Tk classification (consensuses + bins) --------------------
 
 def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
-    name = "s14_classify"
+    name = "s18_classify"
     body = sge_header(
         name, layout.stdout_dir, cfg["sge_h_rt_cpu"],
         cfg.get("sge_h_vmem_gtdbtk", "100G"),
@@ -1123,9 +1418,9 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
     body += textwrap.dedent(
         f"""
 
-        # Build the GTDB-Tk batchfile from Bakta's .fna outputs.
-        # Format: <fasta_path>\\t<genome_id>
-        # Only samples that successfully annotated (their .{ext} exists) are included.
+        # Build the GTDB-Tk batchfile from BOTH Bakta annotated consensuses AND
+        # MetaBAT2 bins. Format: <fasta_path>\\t<genome_id>
+        # Bin IDs are <sample>_bin.N so origin sample is identifiable downstream.
         : > {batchfile}
         """
     )
@@ -1136,7 +1431,7 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
             if [ -s {fna} ]; then
                 printf '%s\\t%s\\n' '{fna}' '{s.sample}' >> {batchfile}
             else
-                log_event WARN "{s.sample}: missing bakta output ({fna}), excluded from GTDB-Tk run"
+                log_event WARN "{s.sample}: missing bakta output ({fna}), excluded from GTDB-Tk"
                 STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
             fi
             """
@@ -1144,8 +1439,22 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
     body += textwrap.dedent(
         f"""
 
+        # Add every MetaBAT2 bin. Prefer the Bakta-annotated .{ext} (cleaner
+        # headers), fall back to the raw .fa if Bakta hasn't run on the bin.
+        # Genome ID is <sample>_bin.N so origin is traceable in GTDB-Tk rows.
+        for f in {layout.bins}/*/*.fa; do
+            [ -e "$f" ] || continue
+            genome_id=$(basename "$f" .fa)
+            bakta_fna={layout.annotate}/${{genome_id}}/${{genome_id}}.{ext}
+            if [ -s "$bakta_fna" ]; then
+                printf '%s\\t%s\\n' "$bakta_fna" "$genome_id" >> {batchfile}
+            else
+                printf '%s\\t%s\\n' "$f" "$genome_id" >> {batchfile}
+            fi
+        done
+
         n_entries=$(wc -l < {batchfile})
-        log_event OK "GTDB-Tk batchfile has $n_entries entries"
+        log_event OK "GTDB-Tk batchfile has $n_entries entries (consensuses + bins)"
         if [ "$n_entries" -eq 0 ]; then
             log_event WARN "no Bakta outputs found, skipping GTDB-Tk entirely"
             exit 0
@@ -1176,16 +1485,947 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
         fi
 
         log_warn_errors_from "$STAGE_LOG"
+        """
+    )
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
 
-        log_event SUMMARY "pipeline finished — log at $PIPELINE_LOG"
+
+# ---- s19 aggregate metrics ----------------------------------------------
+
+def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    name = "s19_aggregate"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        1, cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_report"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    body += f"mkdir -p {layout.reports}\n\n"
+    sample_names = [s.sample for s in samples]
+    body += textwrap.dedent(
+        f"""
+        log_event OK "collecting metrics across stages"
+        python3 - <<'PYEOF'
+        import csv, json, re, sys
+        from pathlib import Path
+
+        ROOT = Path("{layout.root}")
+        OUT  = Path("{layout.reports}") / "metrics.tsv"
+        SAMPLES = {sample_names!r}
+
+        def fastq_count(p):
+            if not p.exists() or p.stat().st_size == 0:
+                return 0
+            n = 0
+            with p.open() as fh:
+                for i, _ in enumerate(fh):
+                    if i % 4 == 0:
+                        n += 1
+            return n
+
+        def fasta_stats(p):
+            if not p.exists() or p.stat().st_size == 0:
+                return 0, 0, 0
+            contigs, total, longest = 0, 0, 0
+            cur = 0
+            with p.open() as fh:
+                for line in fh:
+                    if line.startswith(">"):
+                        if cur > 0:
+                            total += cur
+                            longest = max(longest, cur)
+                            contigs += 1
+                        cur = 0
+                    else:
+                        cur += len(line.strip())
+                if cur > 0:
+                    total += cur
+                    longest = max(longest, cur)
+                    contigs += 1
+            return contigs, total, longest
+
+        def parse_flagstat(p):
+            if not p.exists():
+                return None
+            txt = p.read_text()
+            total = mapped = 0
+            m = re.match(r"^(\\d+)", txt)
+            if m: total = int(m.group(1))
+            m = re.search(r"^(\\d+)\\s*\\+\\s*\\d+\\s+mapped\\s*\\(", txt, re.M)
+            if m: mapped = int(m.group(1))
+            return total, mapped
+
+        def load_bakta_json(p):
+            try:
+                with p.open() as fh:
+                    return json.load(fh)
+            except Exception:
+                return {{}}
+
+        def bakta_feature_counts(p):
+            \"\"\"Try Bakta JSON first; fall back to .txt summary if needed.\"\"\"
+            sample_dir = p.parent
+            stem = p.stem
+            j = sample_dir / f"{{stem}}.json"
+            counts = {{"CDS": 0, "tRNA": 0, "rRNA": 0, "tmRNA": 0,
+                      "ncRNA": 0, "CRISPR": 0, "sORF": 0, "oriC": 0, "oriT": 0}}
+            if j.exists():
+                d = load_bakta_json(j)
+                feats = d.get("features", [])
+                for f in feats:
+                    t = f.get("type", "")
+                    if t in counts:
+                        counts[t] += 1
+                    elif t == "ncRNA-region":
+                        counts["ncRNA"] += 1
+                return counts
+            # Fall back to .txt summary if no JSON
+            t = sample_dir / f"{{stem}}.txt"
+            if t.exists():
+                for line in t.read_text().splitlines():
+                    for k in counts:
+                        if line.startswith(k + ":") or line.startswith(k + " "):
+                            try:
+                                counts[k] = int(line.split()[-1])
+                            except Exception:
+                                pass
+            return counts
+
+        def load_checkm2():
+            p = ROOT / "checkm2" / "output" / "quality_report.tsv"
+            if not p.exists():
+                return {{}}
+            d = {{}}
+            with p.open() as fh:
+                rdr = csv.DictReader(fh, delimiter="\\t")
+                for r in rdr:
+                    d[r["Name"]] = {{
+                        "completeness": float(r.get("Completeness", 0) or 0),
+                        "contamination": float(r.get("Contamination", 0) or 0),
+                    }}
+            return d
+
+        def load_gtdbtk():
+            d = {{}}
+            for f in (ROOT / "gtdbtk" / "output").glob("gtdbtk.*.summary.tsv"):
+                with f.open() as fh:
+                    rdr = csv.DictReader(fh, delimiter="\\t")
+                    for r in rdr:
+                        gid = r.get("user_genome", "")
+                        d[gid] = {{
+                            "classification": r.get("classification", ""),
+                            "domain":  r.get("classification", "").split(";")[0] if ";" in r.get("classification","") else "",
+                        }}
+            return d
+
+        def parse_taxonomy(classification):
+            \"\"\"Parse a GTDB-Tk classification string into ranked components.\"\"\"
+            levels = {{"d__": "domain", "p__": "phylum", "c__": "class",
+                       "o__": "order", "f__": "family", "g__": "genus",
+                       "s__": "species"}}
+            out = {{v: "" for v in levels.values()}}
+            for p in (classification or "").split(";"):
+                p = p.strip()
+                for prefix, name in levels.items():
+                    if p.startswith(prefix):
+                        out[name] = p[len(prefix):]
+                        break
+            # GTDB species fields look like "Escherichia coli" — drop genus prefix
+            if out["species"]:
+                out["species_short"] = out["species"]
+            else:
+                out["species_short"] = ""
+            return out
+
+        def load_expected():
+            p = Path("{layout.reports}") / "expected_taxonomy.tsv"
+            d = {{}}
+            if p.exists():
+                with p.open() as fh:
+                    rdr = csv.DictReader(fh, delimiter="\\t")
+                    for r in rdr:
+                        d[r["sample"]] = {{
+                            "expected_genus":   r.get("expected_genus", ""),
+                            "expected_species": r.get("expected_species", ""),
+                            "expected_strain":  r.get("expected_strain", ""),
+                        }}
+            return d
+
+        checkm2  = load_checkm2()
+        gtdbtk   = load_gtdbtk()
+        expected = load_expected()
+
+        rows = []
+        for s in SAMPLES:
+            raw_reads  = fastq_count(ROOT / "fastq" / f"{{s}}.fastq")
+            filt_reads = fastq_count(ROOT / "fastq_filtered" / f"{{s}}.fastq")
+            flag = parse_flagstat(ROOT / "mapping" / s / "flagstat.txt")
+            total, mapped = (flag if flag else (0, 0))
+            unmapped_reads = fastq_count(ROOT / "mapping" / s / "unmapped.fastq")
+            cons = ROOT / "consensus" / f"{{s}}.fasta"
+            c_n, c_len, c_long = fasta_stats(cons)
+            bakta_fna = ROOT / "bakta" / s / f"{{s}}.fna"
+            feats = bakta_feature_counts(bakta_fna) if bakta_fna.exists() else {{}}
+            meta_asm = ROOT / "meta_flye" / s / "assembly.fasta"
+            m_n, m_len, _ = fasta_stats(meta_asm)
+            bin_files = sorted((ROOT / "bins" / s).glob(f"{{s}}_bin.*.fa")) if (ROOT / "bins" / s).exists() else []
+            n_bins = len(bin_files)
+            cm = checkm2.get(s, {{}})
+            gt = gtdbtk.get(s, {{}})
+            exp = expected.get(s, {{}})
+            tax = parse_taxonomy(gt.get("classification", ""))
+            exp_g = exp.get("expected_genus", "")
+            exp_sp = exp.get("expected_species", "")
+            # Genus match: GTDB's genus == samplesheet's genus
+            genus_match = (tax["genus"] != "" and exp_g != ""
+                           and tax["genus"].lower() == exp_g.lower())
+            # Species match: GTDB's species is "Genus species" — compare full string
+            exp_full = f"{{exp_g}} {{exp_sp}}".strip()
+            species_match = (tax["species"] != "" and exp_full != ""
+                             and tax["species"].lower() == exp_full.lower())
+
+            base = {{
+                "sample": s,
+                "assembly_type": "isolate_consensus",
+                "genome_id": s,
+                "raw_reads": raw_reads,
+                "filtered_reads": filt_reads,
+                "total_reads_mapped_input": total,
+                "mapped_reads": mapped,
+                "unmapped_reads": unmapped_reads,
+                "prop_mapped": (mapped / total if total else 0),
+                "prop_unmapped": (1 - mapped / total) if total else 0,
+                "n_contigs": c_n,
+                "genome_length_bp": c_len,
+                "longest_contig_bp": c_long,
+                "meta_assembly_contigs": m_n,
+                "meta_assembly_length_bp": m_len,
+                "n_bins": n_bins,
+                "completeness": cm.get("completeness", ""),
+                "contamination": cm.get("contamination", ""),
+                "classification": gt.get("classification", ""),
+                "domain": gt.get("domain", ""),
+                "phylum": tax["phylum"],
+                "class": tax["class"],
+                "order": tax["order"],
+                "family": tax["family"],
+                "genus": tax["genus"],
+                "species": tax["species"],
+                "expected_genus": exp_g,
+                "expected_species": exp_sp,
+                "genus_match": genus_match,
+                "species_match": species_match,
+                "cds": feats.get("CDS", 0),
+                "tRNA": feats.get("tRNA", 0),
+                "rRNA": feats.get("rRNA", 0),
+                "tmRNA": feats.get("tmRNA", 0),
+                "ncRNA": feats.get("ncRNA", 0),
+                "CRISPR": feats.get("CRISPR", 0),
+            }}
+            rows.append(base)
+
+            # One row per bin
+            for bf in bin_files:
+                bid = bf.stem  # e.g. <sample>_bin.1
+                bn, blen, blong = fasta_stats(bf)
+                cmb = checkm2.get(bid, {{}})
+                gtb = gtdbtk.get(bid, {{}})
+                btax = parse_taxonomy(gtb.get("classification", ""))
+                rows.append({{
+                    "sample": s,
+                    "assembly_type": "metagenomic_bin",
+                    "genome_id": bid,
+                    "n_contigs": bn,
+                    "genome_length_bp": blen,
+                    "longest_contig_bp": blong,
+                    "completeness": cmb.get("completeness", ""),
+                    "contamination": cmb.get("contamination", ""),
+                    "classification": gtb.get("classification", ""),
+                    "domain": gtb.get("domain", ""),
+                    "phylum": btax["phylum"],
+                    "class": btax["class"],
+                    "order": btax["order"],
+                    "family": btax["family"],
+                    "genus": btax["genus"],
+                    "species": btax["species"],
+                    "expected_genus": exp_g,
+                    "expected_species": exp_sp,
+                }})
+
+        fields = ["sample","assembly_type","genome_id","raw_reads",
+                  "filtered_reads","total_reads_mapped_input","mapped_reads",
+                  "unmapped_reads","prop_mapped","prop_unmapped","n_contigs",
+                  "genome_length_bp","longest_contig_bp","meta_assembly_contigs",
+                  "meta_assembly_length_bp","n_bins","completeness",
+                  "contamination","classification","domain","phylum","class",
+                  "order","family","genus","species","expected_genus",
+                  "expected_species","genus_match","species_match",
+                  "cds","tRNA","rRNA","tmRNA","ncRNA","CRISPR"]
+        with OUT.open("w") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields, delimiter="\\t",
+                               extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        print(f"Wrote {{len(rows)}} rows to {{OUT}}")
+        PYEOF
+
+        n_rows=$(tail -n +2 {layout.reports}/metrics.tsv | wc -l)
+        log_event OK "aggregated $n_rows rows into metrics.tsv"
+        log_warn_errors_from "$STAGE_LOG"
+        """
+    ).strip() + "\n"
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# Standalone Python script for the report stage. Written to submit_scripts/
+# so that the bash wrapper can just invoke it without an embedded heredoc
+# (and so the report code stays out of the outer-f-string brace minefield).
+REPORT_PY = r'''#!/usr/bin/env python3
+"""Generate publication-ready plots + HTML report from metrics.tsv."""
+import argparse, base64, sys
+from html import escape
+from pathlib import Path
+
+try:
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+except ImportError as e:
+    sys.stderr.write(f"missing dependency: {e}\n")
+    sys.exit(1)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--metrics", required=True, type=Path)
+    p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--plots-dir", required=True, type=Path)
+    args = p.parse_args()
+
+    if not args.metrics.exists():
+        sys.stderr.write("metrics.tsv not found — run s19_aggregate first\n")
+        sys.exit(1)
+
+    df = pd.read_csv(args.metrics, sep="\t")
+    if df.empty:
+        sys.stderr.write("metrics.tsv is empty\n")
+        sys.exit(1)
+
+    args.plots_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.rcParams.update({
+        "figure.figsize": (10, 5.5),
+        "figure.dpi": 130,
+        "savefig.dpi": 200,
+        "savefig.bbox": "tight",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.linewidth": 1.0,
+        "axes.titlesize": 13,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 11,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 9,
+        "legend.frameon": False,
+        "font.family": "DejaVu Sans",
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "grid.linestyle": "--",
+    })
+
+    COL_ISOLATE = "#2c7fb8"
+    COL_BIN     = "#fdae61"
+    COL_MAPPED  = "#41ab5d"
+    COL_UNMAP   = "#d73027"
+
+    def save_plot(name):
+        path = args.plots_dir / f"{name}.png"
+        plt.savefig(path)
+        plt.close()
+        return path
+
+    isolates = df[df["assembly_type"] == "isolate_consensus"].copy()
+    bins     = df[df["assembly_type"] == "metagenomic_bin"].copy()
+    plots = []
+
+    # 1. Read flow per sample
+    if not isolates.empty:
+        x = np.arange(len(isolates))
+        w = 0.2
+        fig, ax = plt.subplots()
+        ax.bar(x - 1.5*w, isolates["raw_reads"],      w, label="Raw reads",      color="#bdbdbd")
+        ax.bar(x - 0.5*w, isolates["filtered_reads"], w, label="After chopper",  color="#737373")
+        ax.bar(x + 0.5*w, isolates["mapped_reads"],   w, label="Mapped",         color=COL_MAPPED)
+        ax.bar(x + 1.5*w, isolates["unmapped_reads"], w, label="Unmapped",       color=COL_UNMAP)
+        ax.set_xticks(x)
+        ax.set_xticklabels(isolates["sample"], rotation=45, ha="right")
+        ax.set_ylabel("Read count")
+        ax.set_title("Read flow per sample")
+        ax.legend(loc="upper right", ncol=2)
+        plots.append(("Read flow per sample",
+                      "Raw demultiplexed reads, post-chopper QC reads, reads mapping "
+                      "to the Autocycler consensus, and reads remaining unmapped "
+                      "(input to metagenomic Flye).",
+                      save_plot("read_flow")))
+
+    # 2. Mapping proportion
+    if not isolates.empty:
+        fig, ax = plt.subplots()
+        x = np.arange(len(isolates))
+        pm = pd.to_numeric(isolates["prop_mapped"], errors="coerce").fillna(0).values
+        pu = 1 - pm
+        ax.bar(x, pm, color=COL_MAPPED, label="Mapped")
+        ax.bar(x, pu, bottom=pm, color=COL_UNMAP, label="Unmapped")
+        ax.set_xticks(x)
+        ax.set_xticklabels(isolates["sample"], rotation=45, ha="right")
+        ax.set_ylabel("Proportion of reads")
+        ax.set_title("Mapping proportion per sample")
+        ax.set_ylim(0, 1)
+        ax.legend(loc="upper right")
+        plots.append(("Mapping proportion",
+                      "Fraction of QC-passing reads aligning to the per-sample "
+                      "consensus. Unmapped fraction is fed into metagenomic Flye "
+                      "+ MetaBAT2 to recover co-assembled bins.",
+                      save_plot("prop_mapped")))
+
+    # 3. Assembly sizes
+    if not isolates.empty:
+        fig, ax = plt.subplots()
+        x = np.arange(len(isolates))
+        cons_len = pd.to_numeric(isolates["genome_length_bp"], errors="coerce").fillna(0) / 1e6
+        sample_bin_len = (
+            bins.groupby("sample")["genome_length_bp"]
+                .apply(lambda s: pd.to_numeric(s, errors="coerce").sum())
+            if not bins.empty else pd.Series(dtype=float)
+        ) / 1e6
+        bin_vals = [sample_bin_len.get(s, 0) for s in isolates["sample"]]
+        ax.bar(x, cons_len, color=COL_ISOLATE, label="Isolate consensus")
+        ax.bar(x, bin_vals, bottom=cons_len, color=COL_BIN, label="MetaBAT2 bins (total)")
+        ax.set_xticks(x)
+        ax.set_xticklabels(isolates["sample"], rotation=45, ha="right")
+        ax.set_ylabel("Genome size (Mb)")
+        ax.set_title("Assembly size per sample")
+        ax.legend(loc="upper right")
+        plots.append(("Assembly size per sample",
+                      "Length of Autocycler consensus plus total length of MetaBAT2 "
+                      "bins recovered from unmapped reads.",
+                      save_plot("assembly_size")))
+
+    # 4. CheckM2 completeness vs contamination
+    qc_cols = ["genome_id", "assembly_type", "completeness", "contamination"]
+    qc = pd.concat([
+        isolates[qc_cols] if all(c in isolates.columns for c in qc_cols) else pd.DataFrame(columns=qc_cols),
+        bins[qc_cols]     if all(c in bins.columns     for c in qc_cols) else pd.DataFrame(columns=qc_cols),
+    ])
+    qc["completeness"]  = pd.to_numeric(qc["completeness"],  errors="coerce")
+    qc["contamination"] = pd.to_numeric(qc["contamination"], errors="coerce")
+    qc = qc.dropna(subset=["completeness","contamination"])
+    if not qc.empty:
+        fig, ax = plt.subplots()
+        for typ, col, mk in [("isolate_consensus", COL_ISOLATE, "o"),
+                             ("metagenomic_bin",   COL_BIN,     "s")]:
+            d = qc[qc["assembly_type"] == typ]
+            if not d.empty:
+                ax.scatter(d["completeness"], d["contamination"],
+                           c=col, marker=mk, s=70, edgecolor="white",
+                           linewidth=0.8, label=typ.replace("_", " "),
+                           alpha=0.85)
+        ax.axhline(5,  color="grey", linestyle=":", linewidth=0.8)
+        ax.axvline(90, color="grey", linestyle=":", linewidth=0.8)
+        ax.text(91, max(qc["contamination"].max()*0.92, 4.5),
+                "MIMAG high-quality\n(>=90% / <=5%)", fontsize=8, color="grey")
+        ax.set_xlabel("Completeness (%)")
+        ax.set_ylabel("Contamination (%)")
+        ax.set_title("CheckM2 genome quality")
+        ax.set_xlim(0, 105)
+        ax.set_ylim(-0.5, max(15, qc["contamination"].max() + 2))
+        ax.legend(loc="upper left")
+        plots.append(("CheckM2 quality",
+                      "Completeness vs contamination for every assembly. "
+                      "Dashed lines mark MIMAG high-quality thresholds.",
+                      save_plot("checkm2")))
+
+    # 5. Annotation feature counts
+    if not isolates.empty:
+        feat_cols = ["cds","tRNA","rRNA","tmRNA","ncRNA","CRISPR"]
+        present = [c for c in feat_cols if c in isolates.columns]
+        if present:
+            fig, ax = plt.subplots()
+            x = np.arange(len(isolates))
+            width = 0.8 / len(present)
+            palette = ["#1f78b4","#33a02c","#e31a1c","#ff7f00","#6a3d9a","#b15928"]
+            any_drawn = False
+            for i, c in enumerate(present):
+                vals = pd.to_numeric(isolates[c], errors="coerce").fillna(0)
+                if vals.sum() == 0:
+                    continue
+                ax.bar(x + i*width - 0.4 + width/2, vals, width,
+                       label=c, color=palette[i % len(palette)])
+                any_drawn = True
+            if any_drawn:
+                ax.set_xticks(x)
+                ax.set_xticklabels(isolates["sample"], rotation=45, ha="right")
+                ax.set_ylabel("Feature count")
+                ax.set_title("Bakta annotation features per sample")
+                ax.legend(loc="upper right", ncol=3)
+                plots.append(("Bakta annotation features",
+                              "Coding sequences and non-coding RNA features called "
+                              "by Bakta in each isolate consensus.",
+                              save_plot("annotation_features")))
+            else:
+                plt.close()
+
+    # 6. CDS density (CDS vs genome size)
+    if not isolates.empty:
+        try:
+            cds = pd.to_numeric(isolates["cds"], errors="coerce")
+            gl  = pd.to_numeric(isolates["genome_length_bp"], errors="coerce") / 1e6
+            ok  = cds.notna() & gl.notna() & (cds > 0) & (gl > 0)
+            if ok.sum() > 1:
+                fig, ax = plt.subplots()
+                gl_ok = gl[ok].astype(float).values
+                cds_ok = cds[ok].astype(float).values
+                sample_ok = isolates["sample"][ok].values
+                ax.scatter(gl_ok, cds_ok, c=COL_ISOLATE, s=70,
+                           edgecolor="white", linewidth=0.8)
+                for sample, x, y in zip(sample_ok, gl_ok, cds_ok):
+                    ax.annotate(str(sample), (float(x), float(y)),
+                                fontsize=7, xytext=(3,3), textcoords="offset points",
+                                color="#555")
+                ax.set_xlabel("Genome size (Mb)")
+                ax.set_ylabel("CDS count")
+                ax.set_title("Coding density (CDS vs genome size)")
+                plots.append(("Coding density",
+                              "Bakta CDS count vs genome size. Bacteria typically "
+                              "fall close to a ~900 CDS/Mb line.",
+                              save_plot("cds_vs_size")))
+        except Exception as e:
+            sys.stderr.write(f"plot cds_vs_size skipped: {e}\n")
+            plt.close("all")
+
+    # 7. Taxonomy at phylum level
+    tax = pd.concat([
+        isolates[["genome_id","assembly_type","classification"]] if "classification" in isolates.columns else pd.DataFrame(),
+        bins[["genome_id","assembly_type","classification"]]     if "classification" in bins.columns     else pd.DataFrame(),
+    ])
+    tax = tax[tax["classification"].fillna("") != ""]
+    if not tax.empty:
+        def phylum(c):
+            for p in (c or "").split(";"):
+                if p.startswith("p__"):
+                    return p.replace("p__", "") or "Unclassified"
+            return "Unclassified"
+        tax = tax.assign(phylum=tax["classification"].apply(phylum))
+        counts = tax.groupby(["phylum","assembly_type"]).size().unstack(fill_value=0)
+        counts = counts.loc[counts.sum(axis=1).sort_values(ascending=False).index]
+        fig, ax = plt.subplots(figsize=(10, max(4, 0.4*len(counts))))
+        counts.plot(kind="barh", stacked=True, ax=ax,
+                    color=[COL_ISOLATE, COL_BIN][:counts.shape[1]])
+        ax.set_xlabel("Number of assemblies")
+        ax.set_title("GTDB-Tk classification (phylum level)")
+        ax.invert_yaxis()
+        ax.legend(loc="lower right")
+        plots.append(("Taxonomy (phylum)",
+                      "GTDB-Tk phylum-level assignments across all assemblies.",
+                      save_plot("taxonomy_phylum")))
+
+    # 8. Bins per sample
+    if not bins.empty:
+        counts = bins.groupby("sample").size()
+        fig, ax = plt.subplots()
+        ax.bar(np.arange(len(counts)), counts.values, color=COL_BIN)
+        ax.set_xticks(np.arange(len(counts)))
+        ax.set_xticklabels(counts.index, rotation=45, ha="right")
+        ax.set_ylabel("Number of MetaBAT2 bins")
+        ax.set_title("Metagenomic bins per sample")
+        plots.append(("Bins per sample",
+                      "Number of putative MAGs recovered by MetaBAT2 from the "
+                      "Flye --meta assembly of unmapped reads.",
+                      save_plot("bins_per_sample")))
+
+    # ============================================================
+    # Comparative plots: expected vs observed taxonomy
+    # ============================================================
+
+    all_asm = pd.concat([isolates, bins], ignore_index=True) if not isolates.empty or not bins.empty else pd.DataFrame()
+    for c in ["genus", "species", "phylum", "expected_genus", "expected_species"]:
+        if c not in all_asm.columns:
+            all_asm[c] = ""
+    all_asm[["genus","species","phylum","expected_genus","expected_species"]] = \
+        all_asm[["genus","species","phylum","expected_genus","expected_species"]].fillna("").astype(str)
+
+    # 9. Expected vs observed — sample-level genus/species match heat-table
+    if not isolates.empty:
+        try:
+            iso_view = isolates[["sample","expected_genus","expected_species","genus","species","genus_match","species_match"]].copy()
+            iso_view = iso_view.astype(object).fillna("")
+            fig_h = max(3.5, 0.45 * len(iso_view) + 1)
+            fig, ax = plt.subplots(figsize=(11, fig_h))
+            ax.set_axis_off()
+            col_labels = ["Sample", "Expected genus", "Expected species",
+                          "Observed genus (GTDB)", "Observed species (GTDB)", "Genus match"]
+            cell_text = []
+            cell_colors = []
+            for _, r in iso_view.iterrows():
+                gm = str(r.get("genus_match","")).lower() in ("true","1")
+                sm = str(r.get("species_match","")).lower() in ("true","1")
+                exp_sp = (r["expected_genus"] + " " + r["expected_species"]).strip()
+                row = [r["sample"], r["expected_genus"] or "—",
+                       exp_sp or "—",
+                       r["genus"] or "—",
+                       r["species"] or "—",
+                       ("species" if sm else ("genus" if gm else "mismatch"))]
+                cell_text.append(row)
+                if sm:
+                    row_color = "#c7e9b4"   # green: species match
+                elif gm:
+                    row_color = "#ffffb2"   # yellow: genus match only
+                else:
+                    row_color = "#fcae91"   # red: mismatch
+                cell_colors.append(["#ffffff", "#ffffff", "#ffffff",
+                                    "#ffffff", "#ffffff", row_color])
+            tbl = ax.table(cellText=cell_text, colLabels=col_labels,
+                           cellColours=cell_colors, loc="center", cellLoc="left",
+                           colWidths=[0.16,0.17,0.20,0.17,0.20,0.10])
+            tbl.auto_set_font_size(False)
+            tbl.set_fontsize(8.5)
+            tbl.scale(1, 1.35)
+            for c in range(len(col_labels)):
+                tbl[(0, c)].set_facecolor("#1a3a5c")
+                tbl[(0, c)].set_text_props(color="white", weight="bold")
+            ax.set_title("Expected vs observed taxonomy (isolate consensuses)",
+                         fontsize=12, fontweight="bold", pad=10)
+            plots.append(("Expected vs observed taxonomy",
+                          "Per-sample comparison of the samplesheet's expected "
+                          "genus/species against the GTDB-Tk classification of the "
+                          "Autocycler consensus. Green = species match, yellow = "
+                          "genus match only, red = mismatch.",
+                          save_plot("expected_vs_observed")))
+        except Exception as e:
+            sys.stderr.write(f"plot expected_vs_observed skipped: {e}\n")
+            plt.close("all")
+
+    # 10. Per-sample species composition — stacked bar of assembled Mb by species
+    if not all_asm.empty:
+        try:
+            tmp = all_asm.copy()
+            tmp["genome_length_bp"] = pd.to_numeric(tmp["genome_length_bp"], errors="coerce").fillna(0)
+            def label(row):
+                sp = row.get("species","")
+                if sp:
+                    return sp
+                gn = row.get("genus","")
+                if gn:
+                    return f"{gn} sp."
+                ph = row.get("phylum","")
+                return f"Unclassified {ph}" if ph else "Unclassified"
+            tmp["taxon_label"] = tmp.apply(label, axis=1)
+            comp = tmp.pivot_table(index="sample", columns="taxon_label",
+                                   values="genome_length_bp", aggfunc="sum",
+                                   fill_value=0) / 1e6
+            if comp.shape[1] > 0:
+                # Order columns: place expected match first per sample, then others by total size
+                col_order = comp.sum(axis=0).sort_values(ascending=False).index.tolist()
+                comp = comp[col_order]
+                n_taxa = comp.shape[1]
+                cmap = plt.cm.tab20
+                colors = [cmap(i % 20) for i in range(n_taxa)]
+                fig, ax = plt.subplots(figsize=(11, max(5, 0.4*len(comp)+2)))
+                comp.plot(kind="barh", stacked=True, ax=ax, color=colors, width=0.78)
+                ax.invert_yaxis()
+                ax.set_xlabel("Assembled length (Mb)")
+                ax.set_title("Per-sample assembly composition by GTDB classification")
+                ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0),
+                          fontsize=7.5, frameon=False, ncol=1,
+                          title="Taxon (most → least abundant)",
+                          title_fontsize=8.5)
+                plots.append(("Per-sample assembly composition",
+                              "Total assembled length per sample, broken down by "
+                              "GTDB-Tk classification across all assemblies "
+                              "(consensus + bins). Shows the proportional makeup "
+                              "of unique taxa recovered from each sample.",
+                              save_plot("composition_by_species")))
+        except Exception as e:
+            sys.stderr.write(f"plot composition_by_species skipped: {e}\n")
+            plt.close("all")
+
+    # 11. Sample × phylum heatmap (count of assemblies)
+    if not all_asm.empty:
+        try:
+            tmp = all_asm.copy()
+            tmp["phylum_label"] = tmp["phylum"].replace("", "Unclassified")
+            mat = tmp.pivot_table(index="sample", columns="phylum_label",
+                                  values="genome_id", aggfunc="count",
+                                  fill_value=0)
+            if mat.size > 0:
+                mat = mat[mat.sum(axis=0).sort_values(ascending=False).index]
+                fig, ax = plt.subplots(figsize=(max(7, 0.55*mat.shape[1]+3),
+                                                max(4, 0.4*mat.shape[0]+1)))
+                im = ax.imshow(mat.values, cmap="YlGnBu", aspect="auto")
+                ax.set_xticks(np.arange(mat.shape[1]))
+                ax.set_xticklabels(mat.columns, rotation=40, ha="right", fontsize=9)
+                ax.set_yticks(np.arange(mat.shape[0]))
+                ax.set_yticklabels(mat.index, fontsize=9)
+                # Annotate cells
+                for i in range(mat.shape[0]):
+                    for j in range(mat.shape[1]):
+                        v = mat.values[i, j]
+                        if v > 0:
+                            ax.text(j, i, str(int(v)), ha="center", va="center",
+                                    fontsize=8.5,
+                                    color="white" if v > mat.values.max()*0.55 else "#1a3a5c")
+                cb = plt.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
+                cb.set_label("Assemblies", fontsize=9)
+                ax.set_title("Phylum × sample assembly count")
+                ax.set_xlabel("")
+                ax.set_ylabel("")
+                plots.append(("Phylum × sample heatmap",
+                              "Number of assemblies (consensus + bins) per "
+                              "sample-phylum combination. Cells show how the "
+                              "assembled biomass distributed across higher taxa "
+                              "for each input sample.",
+                              save_plot("phylum_heatmap")))
+        except Exception as e:
+            sys.stderr.write(f"plot phylum_heatmap skipped: {e}\n")
+            plt.close("all")
+
+    # 12. Species richness per sample
+    if not all_asm.empty:
+        try:
+            tmp = all_asm.copy()
+            tmp = tmp[tmp["species"] != ""]
+            if not tmp.empty:
+                rich = tmp.groupby("sample")["species"].nunique().sort_values(ascending=False)
+                fig, ax = plt.subplots(figsize=(10, max(3.5, 0.35*len(rich)+2)))
+                bars = ax.barh(np.arange(len(rich)), rich.values,
+                               color=COL_ISOLATE, edgecolor="white", linewidth=0.6)
+                ax.set_yticks(np.arange(len(rich)))
+                ax.set_yticklabels(rich.index)
+                ax.invert_yaxis()
+                ax.set_xlabel("Unique GTDB species")
+                ax.set_title("Species richness per sample")
+                for i, v in enumerate(rich.values):
+                    ax.text(v + 0.05, i, str(int(v)), va="center", fontsize=9, color="#444")
+                plots.append(("Species richness",
+                              "Number of distinct GTDB-Tk species classifications "
+                              "recovered per sample, pooling the isolate consensus "
+                              "and all metagenomic bins.",
+                              save_plot("species_richness")))
+        except Exception as e:
+            sys.stderr.write(f"plot species_richness skipped: {e}\n")
+            plt.close("all")
+
+    # 13. Sample × genus bubble plot
+    if not all_asm.empty:
+        try:
+            tmp = all_asm.copy()
+            tmp["genus_label"] = tmp["genus"].replace("", "Unclassified")
+            tmp["genome_length_bp"] = pd.to_numeric(tmp["genome_length_bp"], errors="coerce").fillna(0)
+            tmp = tmp[tmp["genus_label"] != "Unclassified"]
+            if not tmp.empty:
+                bub = tmp.groupby(["sample","genus_label"]).agg(
+                    n=("genome_id","count"),
+                    bp=("genome_length_bp","sum")).reset_index()
+                genera = sorted(bub["genus_label"].unique(),
+                                key=lambda g: bub[bub["genus_label"] == g]["bp"].sum(),
+                                reverse=True)
+                samples_ord = sorted(bub["sample"].unique())
+                if len(genera) > 0 and len(samples_ord) > 0:
+                    fig, ax = plt.subplots(figsize=(max(7, 0.6*len(genera)+3),
+                                                    max(4, 0.45*len(samples_ord)+1.5)))
+                    max_bp = bub["bp"].max() if not bub.empty else 1
+                    for _, r in bub.iterrows():
+                        x = genera.index(r["genus_label"])
+                        y = samples_ord.index(r["sample"])
+                        size = 60 + 700 * (r["bp"] / max_bp)
+                        ax.scatter(x, y, s=size, color=COL_ISOLATE,
+                                   edgecolor="white", linewidth=1.0, alpha=0.85)
+                        ax.text(x, y, str(int(r["n"])), ha="center", va="center",
+                                fontsize=8, color="white", fontweight="bold")
+                    ax.set_xticks(np.arange(len(genera)))
+                    ax.set_xticklabels(genera, rotation=40, ha="right", fontsize=9, style="italic")
+                    ax.set_yticks(np.arange(len(samples_ord)))
+                    ax.set_yticklabels(samples_ord, fontsize=9)
+                    ax.set_xlim(-0.5, len(genera) - 0.5)
+                    ax.set_ylim(-0.5, len(samples_ord) - 0.5)
+                    ax.invert_yaxis()
+                    ax.set_title("Sample × genus distribution (bubble size = assembled bp)")
+                    plots.append(("Sample × genus bubble plot",
+                                  "Each bubble represents one or more assemblies of a "
+                                  "given genus in a given sample. Bubble size scales with "
+                                  "total assembled length; numbers inside are assembly "
+                                  "counts.",
+                                  save_plot("sample_genus_bubble")))
+        except Exception as e:
+            sys.stderr.write(f"plot sample_genus_bubble skipped: {e}\n")
+            plt.close("all")
+
+    # ---- HTML ----
+    def img_tag(p):
+        b64 = base64.b64encode(p.read_bytes()).decode()
+        return f'<img class="plot" src="data:image/png;base64,{b64}" alt="{p.stem}">'
+
+    def table_html(d):
+        return d.to_html(index=False, classes="metrics", border=0, na_rep="—")
+
+    n_iso  = len(isolates)
+    n_bins = len(bins)
+    n_samples = isolates["sample"].nunique() if not isolates.empty else 0
+    total = n_iso + n_bins
+    raw_total = int(pd.to_numeric(isolates["raw_reads"], errors="coerce").fillna(0).sum()) if not isolates.empty else 0
+
+    css = """
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+           background: #f8f9fa; color: #222; margin: 0; padding: 2rem 1rem; }
+    .container { max-width: 1100px; margin: 0 auto; }
+    h1 { color: #1a3a5c; border-bottom: 3px solid #1a3a5c; padding-bottom: .5rem; }
+    h2 { color: #1a3a5c; margin-top: 2.5rem; border-bottom: 1px solid #ccc; padding-bottom: .25rem; }
+    .meta { color: #666; font-size: .9rem; margin-bottom: 1.5rem; }
+    .plot-card { background: white; border-radius: 8px; padding: 1.5rem;
+                 box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 1.5rem; }
+    .plot-title { font-weight: 600; font-size: 1.1rem; color: #1a3a5c; margin-bottom: .25rem; }
+    .plot-caption { color: #555; font-size: .9rem; margin-bottom: 1rem; }
+    img.plot { width: 100%; height: auto; display: block; }
+    table.metrics { border-collapse: collapse; font-size: .82rem; width: 100%; background: white; }
+    table.metrics th, table.metrics td { padding: .35rem .6rem; border-bottom: 1px solid #eee; text-align: left; }
+    table.metrics th { background: #1a3a5c; color: white; font-weight: 600; }
+    table.metrics tr:hover td { background: #f3f6fa; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                    gap: 1rem; margin-bottom: 2rem; }
+    .summary-card { background: white; padding: 1rem 1.25rem; border-radius: 8px;
+                    box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .summary-card .value { font-size: 1.8rem; font-weight: 700; color: #1a3a5c; }
+    .summary-card .label { color: #666; font-size: .85rem; text-transform: uppercase; letter-spacing: .05em; }
+    """
+
+    cards = (
+        f'<div class="summary-grid">'
+        f'<div class="summary-card"><div class="value">{n_samples}</div><div class="label">Samples</div></div>'
+        f'<div class="summary-card"><div class="value">{n_iso}</div><div class="label">Isolate consensuses</div></div>'
+        f'<div class="summary-card"><div class="value">{n_bins}</div><div class="label">MetaBAT2 bins</div></div>'
+        f'<div class="summary-card"><div class="value">{total}</div><div class="label">Total assemblies</div></div>'
+        f'<div class="summary-card"><div class="value">{raw_total:,}</div><div class="label">Raw reads (sum)</div></div>'
+        f'</div>'
+    )
+
+    plot_blocks = []
+    for title, caption, png in plots:
+        plot_blocks.append(
+            f'<div class="plot-card">'
+            f'<div class="plot-title">{escape(title)}</div>'
+            f'<div class="plot-caption">{escape(caption)}</div>'
+            f'{img_tag(png)}'
+            f'</div>'
+        )
+
+    iso_cols = ["sample","genome_length_bp","n_contigs","mapped_reads",
+                "unmapped_reads","completeness","contamination",
+                "classification","cds","tRNA","rRNA","n_bins"]
+    iso_cols = [c for c in iso_cols if c in isolates.columns]
+    iso_disp = isolates[iso_cols].copy() if not isolates.empty else pd.DataFrame()
+    if not iso_disp.empty:
+        if "genome_length_bp" in iso_disp:
+            iso_disp["genome_length_bp"] = pd.to_numeric(iso_disp["genome_length_bp"], errors="coerce").apply(
+                lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+        for c in ["mapped_reads","unmapped_reads","cds","tRNA","rRNA"]:
+            if c in iso_disp:
+                iso_disp[c] = pd.to_numeric(iso_disp[c], errors="coerce").apply(
+                    lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+        for c in ["completeness","contamination"]:
+            if c in iso_disp:
+                iso_disp[c] = pd.to_numeric(iso_disp[c], errors="coerce").apply(
+                    lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+
+    bin_cols = ["genome_id","sample","genome_length_bp","n_contigs",
+                "completeness","contamination","classification"]
+    bin_cols = [c for c in bin_cols if c in bins.columns]
+    bin_disp = bins[bin_cols].copy() if not bins.empty else pd.DataFrame()
+    if not bin_disp.empty:
+        if "genome_length_bp" in bin_disp:
+            bin_disp["genome_length_bp"] = pd.to_numeric(bin_disp["genome_length_bp"], errors="coerce").apply(
+                lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+        for c in ["completeness","contamination"]:
+            if c in bin_disp:
+                bin_disp[c] = pd.to_numeric(bin_disp[c], errors="coerce").apply(
+                    lambda v: f"{v:.1f}" if pd.notna(v) else "—")
+
+    html = (
+        "<!doctype html>"
+        "<html><head><meta charset='utf-8'><title>Nanopore pipeline report</title>"
+        f"<style>{css}</style></head><body><div class='container'>"
+        "<h1>Nanopore assembly + annotation pipeline report</h1>"
+        "<p class='meta'>Generated by stage s20_report. "
+        "Source data: <code>reports/metrics.tsv</code>.</p>"
+        f"{cards}"
+        "<h2>Plots</h2>"
+        f"{''.join(plot_blocks) if plot_blocks else '<p>No plots generated (no data?).</p>'}"
+        "<h2>Per-sample summary (isolate consensuses)</h2>"
+        f"{table_html(iso_disp) if not iso_disp.empty else '<p>No data.</p>'}"
+        "<h2>Metagenomic bins</h2>"
+        f"{table_html(bin_disp) if not bin_disp.empty else '<p>No bins recovered.</p>'}"
+        "</div></body></html>"
+    )
+    args.out.write_text(html)
+    print(f"Wrote {args.out} ({len(plots)} plots)")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+# ---- s20 generate plots + HTML report ----------------------------------
+
+def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
+    name = "s20_report"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        1, cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_report"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+
+    # Write the standalone report script once (it's self-contained Python,
+    # not generated per-run, so we keep the f-string brace minefield out of
+    # the bash side entirely).
+    py_path = layout.submit_dir / "_report.py"
+    py_path.write_text(REPORT_PY)
+    py_path.chmod(py_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    body += textwrap.dedent(
+        f"""
+        log_event OK "generating plots + HTML report"
+        set +e
+        python3 {py_path} \\
+            --metrics {layout.reports}/metrics.tsv \\
+            --out {layout.reports}/report.html \\
+            --plots-dir {layout.reports}/plots
+        rc=$?
+        set -e
+        if [ $rc -ne 0 ]; then
+            log_event WARN "report generator rc=$rc"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+        else
+            log_event OK "report written to {layout.reports}/report.html"
+        fi
+
+        log_warn_errors_from "$STAGE_LOG"
+
+        log_event SUMMARY "pipeline finished — log at $PIPELINE_LOG, report at {layout.reports}/report.html"
         echo "" >> $PIPELINE_LOG
         echo "==================== pipeline summary ====================" >> $PIPELINE_LOG
         grep -aE '\\[(START|DONE|FAIL)\\]' $PIPELINE_LOG | tail -200 >> $PIPELINE_LOG
         echo "==========================================================" >> $PIPELINE_LOG
         """
-    )
+    ).strip() + "\n"
     write_script(layout.submit_dir / f"{name}.sh", body)
     return name
+
 
 
 # ---------------------------------------------------------------------------
@@ -1301,12 +2541,21 @@ def main() -> None:
         layout.basecalled, layout.fastq_raw, layout.fastq,
         layout.fastq_filtered, layout.autocycler, layout.assemblies_flat,
         layout.assemblies_fasta, layout.cluster_dir, layout.consensus,
-        layout.annotate, layout.gtdbtk,
+        layout.annotate, layout.mapping, layout.meta_flye, layout.bins,
+        layout.checkm2, layout.gtdbtk, layout.reports,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Touch the pipeline log so tail -f works immediately
     (layout.root / "pipeline.log").touch()
+
+    # Persist the samplesheet's expected taxonomy so the aggregate + report
+    # stages can compare expected vs observed (GTDB-Tk) classifications.
+    exp_path = layout.reports / "expected_taxonomy.tsv"
+    with exp_path.open("w") as fh:
+        fh.write("sample\texpected_genus\texpected_species\texpected_strain\texpected_kingdom\n")
+        for s in samples:
+            fh.write(f"{s.sample}\t{s.genus}\t{s.species}\t{s.strain}\t{s.kingdom}\n")
 
     n01 = stage_basecall(cfg, layout)
     n02 = stage_demux(cfg, layout, hold=n01)
@@ -1321,13 +2570,23 @@ def main() -> None:
     n10 = stage_trim_resolve(cfg, layout, hold=n09)
     n11 = stage_combine(cfg, layout, samples, hold=n10)
     n12 = stage_collect(cfg, layout, samples, hold=n11)
-    n13 = stage_annotate(cfg, layout, samples, hold=n12)
-    n14 = stage_classify(cfg, layout, samples, hold=n13)
+    # Mapping → meta-assembly → binning happen BEFORE Bakta now, so Bakta
+    # can annotate both the autocycler consensuses AND the metabat2 bins in
+    # a single stage.
+    n13 = stage_map_reads(cfg, layout, samples, hold=n12)
+    n14 = stage_meta_assemble(cfg, layout, samples, hold=n13)
+    n15 = stage_bin(cfg, layout, samples, hold=n14)
+    n16 = stage_annotate(cfg, layout, samples, hold=n15)
+    n17 = stage_checkm2(cfg, layout, hold=n16)
+    n18 = stage_classify(cfg, layout, samples, hold=n17)
+    n19 = stage_aggregate(cfg, layout, samples, hold=n18)
+    n20 = stage_report(cfg, layout, hold=n19)
 
     ordered = [
         [n01], [n02], [n03], [n04], [n05],
         n06_list,
-        [n07], [n08], [n09], [n10], [n11], [n12], [n13], [n14],
+        [n07], [n08], [n09], [n10], [n11], [n12],
+        [n13], [n14], [n15], [n16], [n17], [n18], [n19], [n20],
     ]
     write_submit_all(layout, ordered)
     write_pipeline_status(layout)

@@ -2,8 +2,9 @@
 
 End-to-end SGE pipeline that takes raw POD5 files and a sample sheet, runs
 basecalling → demux → QC → Autocycler 8-assembler consensus → Bakta →
-GTDB-Tk, and ends with one annotated, taxonomically classified assembly
-per sample.
+read-mapping → unmapped-read meta-assembly (Flye --meta) → MetaBAT2
+binning → CheckM2 → GTDB-Tk, and produces an HTML report with
+publication-ready plots and per-sample summary tables.
 
 ## Files
 
@@ -102,8 +103,14 @@ What each stage looks at to decide whether to skip:
 | `s10_trim_resolve`| `cluster_*/5_final.gfa` exists (resolve); trimmed marker (trim)                 |
 | `s11_combine`     | `autocycler/<sample>/consensus_assembly.fasta` exists                           |
 | `s12_collect`     | `consensus/<sample>.fasta` exists                                               |
-| `s13_annotate`    | `bakta/<sample>/<sample>.gff3` exists                                           |
-| `s14_classify`    | any `gtdbtk/output/gtdbtk.*.summary.tsv` exists                                 |
+| `s13_map_reads`   | `mapping/<sample>/flagstat.txt` + `unmapped.fastq` exist                        |
+| `s14_meta_assemble` | `meta_flye/<sample>/assembly.fasta` OR `.skipped_low_reads` sentinel          |
+| `s15_bin`         | `bins/<sample>/.binning_done` sentinel                                          |
+| `s16_annotate`    | `bakta/<id>/<id>.gff3` exists (per consensus AND per metabat2 bin)              |
+| `s17_checkm2`     | `checkm2/output/quality_report.tsv` exists                                      |
+| `s18_classify`    | any `gtdbtk/output/gtdbtk.*.summary.tsv` exists (consensuses + bins)            |
+| `s19_aggregate`   | `reports/metrics.tsv` always regenerated (cheap; no skip guard)                 |
+| `s20_report`      | `reports/report.html` regenerated each run                                      |
 
 To **force** re-run for one sample, delete its output for the stage you
 want to redo. For example, to retry compress + everything downstream for
@@ -158,9 +165,17 @@ to apply a stricter threshold to already-filtered samples, delete the
 ├── autocycler/cluster/<sample>/   # s09_cluster (symlink)
 ├── consensus/<sample>.fasta       # s12_collect
 ├── bakta/<sample>/                # s13_annotate (Bakta output)
+├── mapping/<sample>/              # s14_map_reads — mapped.bam, flagstat.txt, unmapped.fastq
+├── meta_flye/<sample>/            # s15_meta_assemble — Flye --meta assembly.fasta
+├── bins/<sample>/                 # s16_bin — <sample>_bin.N.fa MetaBAT2 outputs
+├── checkm2/output/                # s17_checkm2 — quality_report.tsv
 ├── gtdbtk/
-│   ├── batchfile.tsv              # auto-generated from successful Bakta outputs
+│   ├── batchfile.tsv              # consensuses + bins
 │   └── output/                    # gtdbtk.bac120.summary.tsv, ar53, classify/, etc.
+├── reports/
+│   ├── metrics.tsv                # s19_aggregate — long-format per-assembly metrics
+│   ├── plots/*.png                # s20_report — publication-ready figures
+│   └── report.html                # s20_report — final HTML report
 ├── submit_scripts/                # generated SGE scripts
 ├── stdout/                        # SGE per-stage stdout
 └── submit_all.sh
@@ -181,8 +196,14 @@ s01_basecall (GPU)
                                   └─ s10_trim_resolve
                                       └─ s11_combine
                                           └─ s12_collect
-                                              └─ s13_annotate (Bakta)
-                                              └─ s14_classify (GTDB-Tk)
+                                              └─ s13_map_reads (minimap2 → consensus)
+                                              └─ s14_meta_assemble (Flye --meta on unmapped)
+                                                  └─ s15_bin (MetaBAT2)
+                                                      └─ s16_annotate (Bakta on consensuses + bins)
+                                                          └─ s17_checkm2
+                                                              └─ s18_classify (GTDB-Tk, consensuses + bins)
+                                                                  └─ s19_aggregate
+                                                                      └─ s20_report (plots + HTML)
 ```
 
 ## Assumptions

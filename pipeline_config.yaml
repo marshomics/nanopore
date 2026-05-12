@@ -25,6 +25,14 @@ conda_env_autocycler: autocycler
 # Bakta is installed in the env called 'prokka' on this cluster.
 conda_env_bakta: prokka
 conda_env_gtdbtk: gtdbtk3
+# mmseqs env carries minimap2, samtools, flye, metabat2 (with
+# jgi_summarize_bam_contig_depths), and the python/matplotlib/pandas stack
+# used by the report generator. Only CheckM2 lives in its own env.
+conda_env_mapping: mmseqs         # minimap2 + samtools
+conda_env_flye_meta: mmseqs       # flye --meta
+conda_env_metabat: mmseqs         # metabat2 + jgi_summarize_bam_contig_depths
+conda_env_checkm2: checkm2
+conda_env_report: mmseqs          # python + matplotlib + pandas for the HTML report
 
 # ---------- Chopper QC ----------
 chopper_quality: 10
@@ -66,6 +74,14 @@ gtdbtk_cpus: 20
 gtdbtk_pplacer_cpus: 12
 gtdbtk_extension: fna           # Bakta's annotated assembly fasta extension
 gtdbtk_data_path: ""            # leave empty to use the conda env's GTDBTK_DATA_PATH
+
+# ---------- Mapping / meta-assembly / binning / CheckM2 ----------
+minimap2_threads: 20
+flye_meta_threads: 20
+flye_meta_min_unmapped_reads: 100   # skip meta-assembly if unmapped read count is below this
+metabat_min_contig: 1500            # MetaBAT2 default; raise to 2500 for stricter binning
+checkm2_threads: 20
+checkm2_db: /ebio/abt3_scratch/jmarsh/checkm2/db/CheckM2_database/uniref100.KO.1.dmnd
 
 # ---------- SGE ----------
 email: james.marsh@tuebingen.mpg.de

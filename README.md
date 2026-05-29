@@ -12,6 +12,114 @@ publication-ready plots and per-sample summary tables.
 - `pipeline_config.yaml` — paths, models, conda envs, SGE resources, filter thresholds
 - `samplesheet_template.tsv` — fill in one row per barcode
 
+## One-shot install (all environments)
+
+Every stage runs inside a conda env named in `pipeline_config.yaml`. The
+block below creates them all with mamba. You can run it on a fresh
+cluster account in one go; each `mamba create` is independent and idempotent
+in the sense that re-running with `--yes` upgrades in place. Adjust channel
+priority or pin versions to match what your cluster admins want.
+
+```bash
+# Pick a location for non-conda software (dorado binary, MIJAMP clone, dbs)
+SOFTWARE_DIR=/ebio/abt3_scratch/$USER/software
+DB_DIR=/ebio/abt3_scratch/$USER/dbs
+mkdir -p "$SOFTWARE_DIR" "$DB_DIR"
+
+# --- Channels ---
+# (use --override-channels in calls below to keep the env clean)
+CHANNELS="-c bioconda -c conda-forge"
+
+# === 1. nanopore — dorado (external), chopper, flye ===
+# Dorado is distributed as a Linux binary by ONT, not on conda.
+# Pick the version that matches the basecall model you're using.
+DORADO_VER=1.3.1
+cd "$SOFTWARE_DIR"
+wget "https://cdn.oxfordnanoportal.com/software/analysis/dorado-${DORADO_VER}-linux-x64.tar.gz"
+tar -xzf "dorado-${DORADO_VER}-linux-x64.tar.gz"
+rm "dorado-${DORADO_VER}-linux-x64.tar.gz"
+# dorado now lives at $SOFTWARE_DIR/dorado-${DORADO_VER}-linux-x64/bin/dorado
+# Update `dorado_binary:` in pipeline_config.yaml to match.
+
+mamba create -n nanopore $CHANNELS --yes \
+    chopper flye minimap2 samtools
+
+# === 2. autocycler — autocycler + 8 assemblers ===
+mamba create -n autocycler $CHANNELS --yes \
+    autocycler canu flye metamdbg miniasm necat nextdenovo plassembler raven
+
+# === 3. prokka — Bakta annotation ===
+# Env name is 'prokka' for back-compat; the actual tool installed is Bakta.
+mamba create -n prokka $CHANNELS --yes \
+    bakta
+
+# Bakta database (~50 GB; pick `light` to save disk if you don't need all dbs)
+mamba run -n prokka bakta_db download \
+    --output "$DB_DIR/bakta" --type full
+# Update `bakta_db:` in pipeline_config.yaml to:
+#   $DB_DIR/bakta/db
+
+# === 4. gtdbtk3 — GTDB-Tk classification ===
+mamba create -n gtdbtk3 $CHANNELS --yes \
+    gtdbtk
+# GTDB-Tk database (~110 GB, R220 release as of this writing).
+# The env's `download-db.sh` helper handles it; or set GTDBTK_DATA_PATH manually.
+mamba run -n gtdbtk3 download-db.sh "$DB_DIR/gtdbtk"
+# Either set GTDBTK_DATA_PATH in the conda env activation, or put the path
+# into pipeline_config.yaml under `gtdbtk_data_path:`.
+
+# === 5. mmseqs — minimap2, samtools, metabat2, plotting stack ===
+# Everything for s13_map_reads, s15_bin, s17_checkm2 input prep, and s20_report.
+mamba create -n mmseqs $CHANNELS --yes \
+    minimap2 samtools metabat2 \
+    pandas matplotlib numpy
+
+# === 6. checkm2 — genome quality assessment ===
+mamba create -n checkm2 $CHANNELS --yes \
+    checkm2
+# CheckM2 diamond db (~3 GB)
+mamba run -n checkm2 checkm2 database \
+    --download --path "$DB_DIR/checkm2"
+# Set `checkm2_db:` in pipeline_config.yaml to:
+#   $DB_DIR/checkm2/CheckM2_database/uniref100.KO.1.dmnd
+
+# === 7. mijamp — methylation analysis (optional) ===
+mamba create -n mijamp $CHANNELS --yes \
+    pandas meme ont-modkit minimap2 samtools biopython xmltodict
+git clone https://code.ornl.gov/alexander-public/mijamp.git "$SOFTWARE_DIR/mijamp"
+chmod +x "$SOFTWARE_DIR/mijamp/scripts/preprocess"
+# Set `mijamp_dir:` in pipeline_config.yaml to:
+#   $SOFTWARE_DIR/mijamp
+
+# === Verify everything is callable ===
+for env in nanopore autocycler prokka gtdbtk3 mmseqs checkm2 mijamp; do
+    if mamba env list | grep -q "^$env "; then
+        echo "[OK]  env $env exists"
+    else
+        echo "[ERR] env $env not created"
+    fi
+done
+```
+
+Notes / caveats:
+
+- Dorado is a vendor binary; the URL above is for x86_64 Linux. For ARM
+  or macOS, grab the right archive from <https://github.com/nanoporetech/dorado>.
+- The basecall models referenced in `pipeline_config.yaml` (`dna_r10.4.1_*`)
+  must also be downloaded — use `dorado download` after extracting:
+  `<dorado_bin> download --model dna_r10.4.1_e8.2_400bps_sup@v5.2.0`.
+  The pipeline's `basecall_model` and `mod_models` paths must point to
+  wherever you put them.
+- `nextdenovo`, `plassembler`, and `metamdbg` are occasionally flaky on
+  bioconda — if `mamba create` fails for the `autocycler` env, install the
+  difficult tool into its own env or use the upstream install instructions.
+- The default `gtdbtk` db is huge. If your `/scratch` quota is tight, use
+  the lite db (`download-db.sh --lite`) at the cost of less-precise species
+  assignments.
+- `mmseqs` is the env name we use, but it's a misnomer — we install
+  minimap2 + samtools + metabat2 + plotting libs in it, not mmseqs2 itself.
+  Rename in `pipeline_config.yaml` if that bugs you.
+
 ## Sample sheet
 
 TSV with these columns (header required, order doesn't matter):
@@ -111,6 +219,8 @@ What each stage looks at to decide whether to skip:
 | `s18_classify`    | any `gtdbtk/output/gtdbtk.*.summary.tsv` exists (consensuses + bins)            |
 | `s19_aggregate`   | `reports/metrics.tsv` always regenerated (cheap; no skip guard)                 |
 | `s20_report`      | `reports/report.html` regenerated each run                                      |
+| `s02b_demux_bam`  | any `bams/*.bam` exists                                                         |
+| `s21_mijamp`      | `mijamp/<sample>/` exists and non-empty                                         |
 
 To **force** re-run for one sample, delete its output for the stage you
 want to redo. For example, to retry compress + everything downstream for
@@ -197,6 +307,7 @@ s01_basecall (GPU)
                                       └─ s11_combine
                                           └─ s12_collect
                                               └─ s13_map_reads (minimap2 → consensus)
+                                          # (s02b_demux_bam runs in parallel off s01, feeds s21_mijamp)
                                               └─ s14_meta_assemble (Flye --meta on unmapped)
                                                   └─ s15_bin (MetaBAT2)
                                                       └─ s16_annotate (Bakta on consensuses + bins)
@@ -204,16 +315,40 @@ s01_basecall (GPU)
                                                               └─ s18_classify (GTDB-Tk, consensuses + bins)
                                                                   └─ s19_aggregate
                                                                       └─ s20_report (plots + HTML)
+                                                                          └─ s21_mijamp (needs s20 done AND s02b_demux_bam done)
 ```
 
 ## Assumptions
 
 - The conda envs named in `pipeline_config.yaml` exist and contain the
-  expected tools: `nanopore` → dorado + chopper, `autocycler` → autocycler
-  plus every assembler in `assemblers:`, the env named in
-  `conda_env_bakta` (default `prokka`) has Bakta installed, and the env
-  named in `conda_env_gtdbtk` (default `gtdbtk3`) has GTDB-Tk plus a
-  working `GTDBTK_DATA_PATH` (or supply `gtdbtk_data_path:` in the config).
+  expected tools: `nanopore` → dorado + chopper + flye, `autocycler` →
+  autocycler plus every assembler in `assemblers:`, `prokka` → Bakta,
+  `gtdbtk3` → GTDB-Tk (with `GTDBTK_DATA_PATH` set), `mmseqs` → minimap2 +
+  samtools + metabat2 + pandas/matplotlib, `checkm2` → CheckM2, and (if
+  using MIJAMP) `mijamp` → pandas, meme, ont-modkit, minimap2, samtools,
+  biopython, xmltodict.
+
+## MIJAMP setup
+
+MIJAMP is optional but enabled when `mijamp_dir` in
+`pipeline_config.yaml` points to a valid clone of the MIJAMP repo. Install
+once on the cluster:
+
+```bash
+git clone https://code.ornl.gov/alexander-public/mijamp.git /path/to/mijamp
+mamba create -n mijamp -c bioconda -c conda-forge \
+    pandas meme ont-modkit minimap2 samtools biopython xmltodict
+```
+
+Then set in `pipeline_config.yaml`:
+
+```yaml
+mijamp_dir: /path/to/mijamp
+conda_env_mijamp: mijamp
+```
+
+Leaving `mijamp_dir` empty makes `s21_mijamp` log a `WARN` and exit
+cleanly, so the rest of the pipeline still produces all other outputs.
 - Dorado demux output filenames contain the barcode label. The `s03_rename`
   step matches `*<barcode>*.fastq[.gz]`.
 - Autocycler subsample produces 4 subsamples named `sample_01.fastq` …

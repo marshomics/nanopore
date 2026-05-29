@@ -32,6 +32,9 @@ Stages (each emits one SGE script unless noted)
   s12_collect        gather consensus_assembly.fasta -> consensus/<sample>.fasta
   s13_annotate       Bakta per sample using samplesheet metadata
   s14_classify       GTDB-Tk classify_wf across all Bakta .fna outputs
+  s02b_demux_bam     parallel demux that emits sorted BAMs (retains MM/ML
+                     methylation tags from basecalling)
+  s21_mijamp         MIJAMP preprocess per sample on the demux BAM + Bakta .fna
 
 Logging + resume
 ----------------
@@ -323,12 +326,14 @@ class Layout:
     cluster_dir: Path
     consensus: Path
     annotate: Path
+    bams: Path
     mapping: Path
     meta_flye: Path
     bins: Path
     checkm2: Path
     gtdbtk: Path
     reports: Path
+    mijamp: Path
     submit_dir: Path
     stdout_dir: Path
 
@@ -348,12 +353,14 @@ class Layout:
             cluster_dir=root / "autocycler" / "cluster",
             consensus=root / "consensus",
             annotate=root / "bakta",
+            bams=root / "bams",
             mapping=root / "mapping",
             meta_flye=root / "meta_flye",
             bins=root / "bins",
             checkm2=root / "checkm2",
             gtdbtk=root / "gtdbtk",
             reports=root / "reports",
+            mijamp=root / "mijamp",
             submit_dir=root / "submit_scripts",
             stdout_dir=root / "stdout",
         )
@@ -450,6 +457,57 @@ def stage_demux(cfg: dict, layout: Layout, hold: str) -> str:
                 exit $rc
             fi
             log_event OK "demux complete"
+        fi
+
+        log_warn_errors_from "$STAGE_LOG"
+        """
+    ).strip() + "\n"
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s02b demux to BAM (parallel branch off s01) ------------------------
+
+def stage_demux_bam(cfg: dict, layout: Layout, hold: str) -> str:
+    """A second demux that emits sorted BAMs (preserving the MM/ML
+    methylation tags from basecalling) into <output>/bams/. Runs in parallel
+    with s02_demux off the same s01_basecall output."""
+    name = "s02b_demux_bam"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_demux"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    body += textwrap.dedent(
+        f"""
+        mkdir -p {layout.bams}
+
+        # Resume if any *.bam already exists in the demux BAM dir.
+        if find {layout.bams} -type f -name "*.bam" 2>/dev/null | grep -q .; then
+            log_event SKIP "demux BAM output already present in {layout.bams}"
+        elif [ ! -s {layout.bam_path} ]; then
+            log_event WARN "basecalls.bam missing, cannot demux to BAM"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+        else
+            log_event OK "starting dorado demux (BAM, --sort-bam, preserves MM/ML)"
+            set +e
+            {cfg['dorado_binary']} demux \\
+                --output-dir {layout.bams} \\
+                --no-classify \\
+                --threads {cfg['sge_pe_parallel']} \\
+                --emit-summary \\
+                --sort-bam \\
+                {layout.bam_path}
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ]; then
+                log_event WARN "dorado demux (BAM) rc=$rc"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                exit $rc
+            fi
+            n_bams=$(find {layout.bams} -type f -name "*.bam" | wc -l)
+            log_event OK "demux (BAM) produced $n_bams files"
         fi
 
         log_warn_errors_from "$STAGE_LOG"
@@ -1675,9 +1733,50 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                         }}
             return d
 
-        checkm2  = load_checkm2()
-        gtdbtk   = load_gtdbtk()
-        expected = load_expected()
+        def load_plassembler_clusters():
+            \"\"\"Parse stdout/s09_cluster.log to count qc_pass clusters that
+            had plassembler-derived source contigs, per sample. Used to decide
+            whether a consensus should be split into chromosome + plasmid(s)
+            in the report. Without Plassembler validation, multi-contig
+            consensuses are treated as one main assembly.\"\"\"
+            log_path = ROOT / "stdout" / "s09_cluster.log"
+            result = {{}}
+            if not log_path.exists():
+                return result
+            current_sample = None
+            in_cluster = False
+            has_plass = False
+            for line in log_path.read_text(errors="ignore").splitlines():
+                stripped = line.strip()
+                m = re.search(r'--autocycler_dir\\s+\\S+/([^/\\s]+)\\s*$', stripped)
+                if m:
+                    current_sample = m.group(1)
+                    result.setdefault(current_sample, 0)
+                    in_cluster = False
+                    has_plass = False
+                    continue
+                if stripped.startswith("Cluster "):
+                    in_cluster = True
+                    has_plass = False
+                    continue
+                if not in_cluster:
+                    continue
+                if "_plassembler_" in stripped:
+                    has_plass = True
+                elif stripped.startswith("passed QC"):
+                    if has_plass and current_sample:
+                        result[current_sample] = result.get(current_sample, 0) + 1
+                    in_cluster = False
+                    has_plass = False
+                elif stripped.startswith("failed QC"):
+                    in_cluster = False
+                    has_plass = False
+            return result
+
+        checkm2     = load_checkm2()
+        gtdbtk      = load_gtdbtk()
+        expected    = load_expected()
+        plass_clust = load_plassembler_clusters()
 
         rows = []
         for s in SAMPLES:
@@ -1688,18 +1787,26 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
             unmapped_reads = fastq_count(ROOT / "mapping" / s / "unmapped.fastq")
             cons = ROOT / "consensus" / f"{{s}}.fasta"
             c_n, c_len, c_long = fasta_stats(cons)
-            # Split consensus into chromosome (largest contig) + plasmids (rest)
+            # Split consensus into chromosome (largest contig) + plasmid contigs,
+            # but ONLY treat non-largest contigs as plasmids if Plassembler
+            # validated at least one plasmid cluster for this sample (parsed
+            # from the s09_cluster log). Otherwise the consensus is shown as a
+            # single main assembly even if it has multiple contigs.
             contigs_sorted = fasta_per_contig(cons)
+            has_plassembler_plasmid = plass_clust.get(s, 0) > 0
             if contigs_sorted:
                 chrom_name, chrom_len = contigs_sorted[0]
-                plasmid_contigs = contigs_sorted[1:]
             else:
                 chrom_name, chrom_len = "", 0
+            if has_plassembler_plasmid and len(contigs_sorted) > 1:
+                plasmid_contigs = contigs_sorted[1:]
+            else:
                 plasmid_contigs = []
             plasmid_count = len(plasmid_contigs)
             plasmid_total_bp = sum(L for _, L in plasmid_contigs)
             plasmid_names = ";".join(n for n, _ in plasmid_contigs)
             plasmid_lengths = ";".join(str(L) for _, L in plasmid_contigs)
+            n_plassembler_clusters = plass_clust.get(s, 0)
             bakta_fna = ROOT / "bakta" / s / f"{{s}}.fna"
             feats = bakta_feature_counts(bakta_fna) if bakta_fna.exists() else {{}}
             meta_asm = ROOT / "meta_flye" / s / "assembly.fasta"
@@ -1740,6 +1847,7 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                 "plasmid_total_bp": plasmid_total_bp,
                 "plasmid_names": plasmid_names,
                 "plasmid_lengths": plasmid_lengths,
+                "plassembler_clusters": n_plassembler_clusters,
                 "meta_assembly_contigs": m_n,
                 "meta_assembly_length_bp": m_len,
                 "n_bins": n_bins,
@@ -1800,7 +1908,8 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                   "genome_length_bp","longest_contig_bp",
                   "chromosome_length_bp","chromosome_contig",
                   "plasmid_count","plasmid_total_bp","plasmid_names",
-                  "plasmid_lengths","meta_assembly_contigs",
+                  "plasmid_lengths","plassembler_clusters",
+                  "meta_assembly_contigs",
                   "meta_assembly_length_bp","n_bins","completeness",
                   "contamination","classification","domain","phylum","class",
                   "order","family","genus","species","expected_genus",
@@ -2310,12 +2419,21 @@ def main():
             sys.stderr.write(f"plot sample_genus_bubble skipped: {e}\n")
             plt.close("all")
 
-    # 14. Replicon breakdown — chromosome vs plasmids vs bins per sample
+    # 14. Replicon breakdown — main assembly vs Plassembler-validated plasmids vs bins
     if not isolates.empty:
         try:
             x = np.arange(len(isolates))
-            chrom = pd.to_numeric(isolates.get("chromosome_length_bp", 0), errors="coerce").fillna(0) / 1e6
-            plas  = pd.to_numeric(isolates.get("plasmid_total_bp", 0),    errors="coerce").fillna(0) / 1e6
+            plas_count = pd.to_numeric(isolates.get("plasmid_count", 0), errors="coerce").fillna(0)
+            total_len  = pd.to_numeric(isolates.get("genome_length_bp", 0), errors="coerce").fillna(0)
+            chrom_len  = pd.to_numeric(isolates.get("chromosome_length_bp", 0), errors="coerce").fillna(0)
+            # When Plassembler validated >=1 plasmid, the chromosome bar is the
+            # largest contig and plasmid bar is the sum of other contigs.
+            # When Plassembler validated 0 plasmids, show the FULL consensus
+            # as the main bar (no plasmid layer) — matches the report cards.
+            has_plas = plas_count > 0
+            chrom = np.where(has_plas, chrom_len, total_len) / 1e6
+            plas  = pd.to_numeric(isolates.get("plasmid_total_bp", 0), errors="coerce").fillna(0) / 1e6
+            plas  = np.where(has_plas, plas, 0)
             # Sum bin lengths per sample
             if not bins.empty:
                 sample_bin_len = bins.groupby("sample")["genome_length_bp"].apply(
@@ -2324,9 +2442,11 @@ def main():
             else:
                 bin_vals = np.zeros(len(isolates))
             fig, ax = plt.subplots(figsize=(11, max(5, 0.5*len(isolates)+1)))
-            ax.barh(x, chrom, color="#2c7fb8", label="Chromosome")
-            ax.barh(x, plas,  left=chrom, color="#7b68ee", label="Plasmid(s)")
-            ax.barh(x, bin_vals, left=chrom + plas, color=COL_BIN, label="MetaBAT2 bins")
+            ax.barh(x, chrom, color="#2c7fb8", label="Main assembly")
+            ax.barh(x, plas,  left=chrom, color="#7b68ee",
+                    label="Plassembler-validated plasmid(s)")
+            ax.barh(x, bin_vals, left=chrom + plas, color=COL_BIN,
+                    label="MetaBAT2 bins")
             ax.set_yticks(x)
             ax.set_yticklabels(isolates["sample"])
             ax.invert_yaxis()
@@ -2335,16 +2455,19 @@ def main():
             ax.legend(loc="lower right")
             # Annotate counts on the right of each bar
             for i, (cl, pl, bn) in enumerate(zip(chrom, plas, bin_vals)):
-                n_plas = int(isolates["plasmid_count"].iloc[i]) if "plasmid_count" in isolates.columns else 0
-                n_bin = int(bins[bins["sample"] == isolates["sample"].iloc[i]].shape[0]) if not bins.empty else 0
+                n_plas_i = int(isolates["plasmid_count"].iloc[i]) if "plasmid_count" in isolates.columns else 0
+                n_bin_i  = int(bins[bins["sample"] == isolates["sample"].iloc[i]].shape[0]) if not bins.empty else 0
+                main_lbl = ("chr" if n_plas_i > 0 else "consensus")
                 ax.text(cl + pl + bn + 0.05, i,
-                        f"chr {cl:.2f} Mb · {n_plas} plasmid(s) · {n_bin} bin(s)",
+                        f"{main_lbl} {cl:.2f} Mb · {n_plas_i} plasmid(s) · {n_bin_i} bin(s)",
                         fontsize=8, va="center", color="#444")
             plots.append(("Replicon breakdown per sample",
-                          "For each isolate: the chromosome (longest consensus "
-                          "contig), the sum of plasmid contigs (other consensus "
-                          "contigs), and the total length of MetaBAT2 bins recovered "
-                          "from unmapped reads.",
+                          "For each isolate: the main Autocycler assembly (whole "
+                          "consensus if no plasmid was validated; chromosome only "
+                          "if Plassembler validated plasmid contigs in the "
+                          "clustering), the sum of any Plassembler-validated "
+                          "plasmid contigs, and the total length of MetaBAT2 bins "
+                          "recovered from unmapped reads.",
                           save_plot("replicon_breakdown")))
         except Exception as e:
             sys.stderr.write(f"plot replicon_breakdown skipped: {e}\n")
@@ -2482,17 +2605,19 @@ def main():
             exp_str    = (exp_gen + " " + exp_sp).strip() or "—"
             comp = row.get("completeness", "")
             cont = row.get("contamination", "")
-            # Render plasmid block
+            # Render plasmid block only when Plassembler validated a plasmid.
+            # Without Plassembler support, multi-contig consensuses are shown
+            # as a single main assembly (no plasmid section at all).
             if plas_list:
                 plas_rows = "".join(
                     f"<li><code>{escape(n)}</code> &mdash; {fmt_bp(l)}</li>"
                     for n, l in plas_list
                 )
                 plas_html = f"<ul class='replicon-list'>{plas_rows}</ul>"
-            elif n_plas > 0:
-                plas_html = f"<p class='replicon-empty'>{n_plas} plasmid contig(s) (unnamed)</p>"
+                show_plasmid_section = True
             else:
-                plas_html = "<p class='replicon-empty'>None detected.</p>"
+                plas_html = ""
+                show_plasmid_section = False
 
             # Bins for this sample
             if bin_by_sample is not None and s in bin_by_sample.groups:
@@ -2521,19 +2646,42 @@ def main():
             else:
                 badge = ""
 
+            # Main assembly description: show different info depending on
+            # whether Plassembler validated any plasmid clusters.
+            total_len = row.get("genome_length_bp", 0)
+            n_total_contigs = int(float(row.get("n_contigs", 0) or 0))
+            if show_plasmid_section:
+                main_desc = (
+                    f"<p>Chromosome contig: {fmt_bp(chrom_bp)}"
+                    f"{' ' + badge if badge else ''}</p>"
+                )
+            else:
+                contig_label = "1 contig" if n_total_contigs == 1 else f"{n_total_contigs} contigs"
+                main_desc = (
+                    f"<p>Consensus: {fmt_bp(total_len)} across {contig_label}"
+                    f"{' ' + badge if badge else ''}</p>"
+                )
+
+            plasmid_block_html = ""
+            if show_plasmid_section:
+                plasmid_block_html = (
+                    f"<div class='replicon-section'>"
+                    f"<div class='replicon-label plasmids'>Plasmid contigs ({n_plas})"
+                    f" &middot; Plassembler-validated</div>"
+                    f"{plas_html}"
+                    f"</div>"
+                )
+
             sample_cards.append(
                 f"<div class='sample-card'>"
                 f"<h3>{escape(s)}</h3>"
                 f"<p class='sample-meta'>Expected: <em>{escape(exp_str)}</em></p>"
                 f"<div class='replicon-section'>"
                 f"<div class='replicon-label main-asm'>Main assembly (Autocycler consensus)</div>"
-                f"<p>Chromosome contig: {fmt_bp(chrom_bp)}{' ' + badge if badge else ''}</p>"
+                f"{main_desc}"
                 f"<p>Classification: {fmt_classification(classification)}</p>"
                 f"</div>"
-                f"<div class='replicon-section'>"
-                f"<div class='replicon-label plasmids'>Plasmid contigs ({n_plas})</div>"
-                f"{plas_html}"
-                f"</div>"
+                f"{plasmid_block_html}"
                 f"<div class='replicon-section'>"
                 f"<div class='replicon-label bins'>MetaBAT2 bins ({int(row.get('n_bins',0) or 0)})</div>"
                 f"{bin_html}"
@@ -2651,6 +2799,79 @@ def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
     return name
 
 
+# ---- s21 MIJAMP preprocess ----------------------------------------------
+
+def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    """Run MIJAMP's preprocess script per sample using the methylation-tagged
+    BAM from s02b_demux_bam and the corresponding Bakta-annotated .fna from
+    s16_annotate. MIJAMP is expected to be git-cloned at cfg['mijamp_dir'].
+    """
+    name = "s21_mijamp"
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(cfg["conda_env_mijamp"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    threads = int(cfg.get("mijamp_threads", 20))
+    mij_dir = cfg.get("mijamp_dir", "") or ""
+    body += textwrap.dedent(
+        f"""
+        MIJAMP_DIR="{mij_dir}"
+        if [ -z "$MIJAMP_DIR" ] || [ ! -f "$MIJAMP_DIR/scripts/preprocess" ]; then
+            log_event WARN "MIJAMP installation not found at '$MIJAMP_DIR' (set mijamp_dir in pipeline_config.yaml). Skipping."
+            exit 0
+        fi
+        chmod +x "$MIJAMP_DIR/scripts/preprocess" 2>/dev/null || true
+
+        mkdir -p {layout.mijamp}
+
+        """
+    )
+    for s in samples:
+        out_dir = f"{layout.mijamp}/{s.sample}"
+        fna     = f"{layout.annotate}/{s.sample}/{s.sample}.fna"
+        body += textwrap.dedent(
+            f"""
+            # ---- {s.sample} (barcode {s.barcode}) ----
+            if [ -d {out_dir} ] && [ -n "$(ls -A {out_dir} 2>/dev/null)" ]; then
+                log_event SKIP "{s.sample} (MIJAMP output dir not empty)"
+            else
+                # Locate the per-barcode BAM. dorado demux with --no-classify
+                # writes one BAM per BC tag, with the barcode label in the name.
+                bam_file=$(find {layout.bams} -maxdepth 2 -type f -name "*{s.barcode}*.bam" 2>/dev/null | head -1)
+                if [ -z "$bam_file" ]; then
+                    log_event WARN "{s.sample}: no demux BAM matching '{s.barcode}' in {layout.bams}, skipping"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                elif [ ! -s {fna} ]; then
+                    log_event WARN "{s.sample}: Bakta .fna missing ({fna}), skipping"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                else
+                    log_event OK "{s.sample}: MIJAMP preprocess (bam=$bam_file, genome={fna})"
+                    mkdir -p {out_dir}
+                    set +e
+                    "$MIJAMP_DIR/scripts/preprocess" \\
+                        -b "$bam_file" \\
+                        -g {fna} \\
+                        -t {threads} \\
+                        -o {out_dir}
+                    rc=$?
+                    set -e
+                    if [ $rc -ne 0 ]; then
+                        log_event WARN "{s.sample}: MIJAMP rc=$rc"
+                        STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    else
+                        log_event OK "{s.sample}: MIJAMP done"
+                    fi
+                fi
+            fi
+
+            """
+        )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
 
 # ---------------------------------------------------------------------------
 # Driver
@@ -2765,8 +2986,9 @@ def main() -> None:
         layout.basecalled, layout.fastq_raw, layout.fastq,
         layout.fastq_filtered, layout.autocycler, layout.assemblies_flat,
         layout.assemblies_fasta, layout.cluster_dir, layout.consensus,
-        layout.annotate, layout.mapping, layout.meta_flye, layout.bins,
-        layout.checkm2, layout.gtdbtk, layout.reports,
+        layout.annotate, layout.bams, layout.mapping, layout.meta_flye,
+        layout.bins, layout.checkm2, layout.gtdbtk, layout.reports,
+        layout.mijamp,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -2783,6 +3005,10 @@ def main() -> None:
 
     n01 = stage_basecall(cfg, layout)
     n02 = stage_demux(cfg, layout, hold=n01)
+    # Parallel branch: dorado demux to BAM (preserves MM/ML methylation tags).
+    # Runs in parallel with s02_demux off the same s01_basecall output, then
+    # feeds s21_mijamp at the end.
+    n02b = stage_demux_bam(cfg, layout, hold=n01)
     n03 = stage_rename(cfg, layout, samples, hold=n02)
     n04 = stage_filter(cfg, layout, samples, hold=n03)
     n05 = stage_subsample(cfg, layout, samples, hold=n04)
@@ -2805,12 +3031,15 @@ def main() -> None:
     n18 = stage_classify(cfg, layout, samples, hold=n17)
     n19 = stage_aggregate(cfg, layout, samples, hold=n18)
     n20 = stage_report(cfg, layout, hold=n19)
+    # MIJAMP needs both the demux BAMs (s02b) and the Bakta .fna (s16, which
+    # is upstream of s20). Hold on both so SGE waits for the slower of the two.
+    n21 = stage_mijamp(cfg, layout, samples, hold=f"{n20},{n02b}")
 
     ordered = [
-        [n01], [n02], [n03], [n04], [n05],
+        [n01], [n02], [n02b], [n03], [n04], [n05],
         n06_list,
         [n07], [n08], [n09], [n10], [n11], [n12],
-        [n13], [n14], [n15], [n16], [n17], [n18], [n19], [n20],
+        [n13], [n14], [n15], [n16], [n17], [n18], [n19], [n20], [n21],
     ]
     write_submit_all(layout, ordered)
     write_pipeline_status(layout)

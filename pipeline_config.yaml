@@ -33,6 +33,8 @@ conda_env_flye_meta: nanopore     # flye --meta
 conda_env_metabat: mmseqs         # metabat2 + jgi_summarize_bam_contig_depths
 conda_env_checkm2: checkm2
 conda_env_report: mmseqs          # python + matplotlib + pandas for the HTML report
+# MIJAMP env needs: pandas, meme, ont-modkit, minimap2, samtools, biopython, xmltodict
+conda_env_mijamp: mijamp
 
 # ---------- Chopper QC ----------
 chopper_quality: 10
@@ -82,6 +84,13 @@ flye_meta_min_unmapped_reads: 100   # skip meta-assembly if unmapped read count 
 metabat_min_contig: 1500            # MetaBAT2 default; raise to 2500 for stricter binning
 checkm2_threads: 20
 checkm2_db: /ebio/abt3_scratch/jmarsh/checkm2/db/CheckM2_database/uniref100.KO.1.dmnd
+
+# ---------- MIJAMP ----------
+# Path to a git-cloned MIJAMP repo. Empty value disables the s21_mijamp stage.
+# Install once with:
+#   git clone https://code.ornl.gov/alexander-public/mijamp.git /path/to/mijamp
+mijamp_dir: ""
+mijamp_threads: 20
 
 # ---------- SGE ----------
 email: james.marsh@tuebingen.mpg.de

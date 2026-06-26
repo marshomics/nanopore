@@ -101,6 +101,34 @@ import re as _re
 PLASMID_RE = _re.compile(r"^p[a-zA-Z0-9._-]{0,23}$")
 
 
+def barcode_filename_patterns(barcode: str) -> List[str]:
+    """Return filename glob patterns to match a samplesheet barcode against
+    dorado's actual output filenames. Handles both ONT kit naming (NB13) and
+    dorado's internal naming (barcode13, zero-padded to two digits).
+
+    For NB13 returns ['NB13', 'barcode13'].
+    For barcode13 returns ['barcode13', 'NB13'].
+    For NB5 returns ['NB5', 'barcode05'].
+    """
+    cands = [barcode]
+    m = _re.match(r"^NB0*(\d+)$", barcode)
+    if m:
+        n = int(m.group(1))
+        cands.append(f"barcode{n:02d}")
+    m = _re.match(r"^barcode0*(\d+)$", barcode)
+    if m:
+        n = int(m.group(1))
+        cands.append(f"NB{n}")
+    # dedupe while preserving order
+    seen = set()
+    out = []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 @dataclass
 class Sample:
     barcode: str
@@ -456,6 +484,18 @@ def stage_demux(cfg: dict, layout: Layout, hold: str) -> str:
                 log_event WARN "dorado demux exited with code $rc"
                 exit $rc
             fi
+            # Dorado demux preserves the MinKNOW directory hierarchy
+            # (experiment_id/sample_id/run_id/fastq_pass/barcodeNN/). Flatten
+            # it so downstream stages can glob for *barcodeNN*.fastq directly
+            # in {layout.fastq_raw}/.
+            log_event OK "flattening nested demux output"
+            find {layout.fastq_raw} -mindepth 2 -type f \\( -name "*.fastq" -o -name "*.fastq.gz" -o -name "*summary*.tsv" \\) | while read f; do
+                bn=$(basename "$f")
+                if [ ! -e "{layout.fastq_raw}/$bn" ]; then
+                    mv "$f" "{layout.fastq_raw}/$bn"
+                fi
+            done
+            find {layout.fastq_raw} -mindepth 1 -type d -empty -delete 2>/dev/null || true
             log_event OK "demux complete"
         fi
 
@@ -506,7 +546,18 @@ def stage_demux_bam(cfg: dict, layout: Layout, hold: str) -> str:
                 STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                 exit $rc
             fi
-            n_bams=$(find {layout.bams} -type f -name "*.bam" | wc -l)
+            # Flatten the MinKNOW-style nested output. Dorado writes
+            # bams/<experiment_id>/<sample_id>/<run_id>/bam_pass/barcodeNN/<file>.bam
+            # — we move everything to bams/ so s21_mijamp can find it via glob.
+            log_event OK "flattening nested BAM output"
+            find {layout.bams} -mindepth 2 -type f \\( -name "*.bam" -o -name "*.bam.bai" -o -name "*summary*.tsv" \\) | while read f; do
+                bn=$(basename "$f")
+                if [ ! -e "{layout.bams}/$bn" ]; then
+                    mv "$f" "{layout.bams}/$bn"
+                fi
+            done
+            find {layout.bams} -mindepth 1 -type d -empty -delete 2>/dev/null || true
+            n_bams=$(find {layout.bams} -maxdepth 1 -type f -name "*.bam" | wc -l)
             log_event OK "demux (BAM) produced $n_bams files"
         fi
 
@@ -534,15 +585,21 @@ def stage_rename(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
     )
     for s in samples:
         out = f"{layout.fastq}/{s.sample}.fastq"
+        # Build a multi-pattern find that accepts both NB13 and barcode13
+        # naming so the samplesheet can use either convention.
+        pats = barcode_filename_patterns(s.barcode)
+        name_clauses = " -o ".join(
+            f'-name "*{p}*.fastq" -o -name "*{p}*.fastq.gz"' for p in pats
+        )
         body += textwrap.dedent(
             f"""
-            # {s.sample} <- {s.barcode}
+            # {s.sample} <- {s.barcode} (matches: {", ".join(pats)})
             if [ -s {out} ]; then
                 log_event SKIP "{s.sample} (fastq exists)"
             else
-                files=$(find {layout.fastq_raw} -type f \\( -name "*{s.barcode}*.fastq" -o -name "*{s.barcode}*.fastq.gz" \\) 2>/dev/null)
+                files=$(find {layout.fastq_raw} -type f \\( {name_clauses} \\) 2>/dev/null)
                 if [ -z "$files" ]; then
-                    log_event WARN "{s.sample}: no demux output for {s.barcode}"
+                    log_event WARN "{s.sample}: no demux output matching any of: {', '.join(pats)}"
                     STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                 else
                     : > {out}
@@ -2831,17 +2888,22 @@ def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
     for s in samples:
         out_dir = f"{layout.mijamp}/{s.sample}"
         fna     = f"{layout.annotate}/{s.sample}/{s.sample}.fna"
+        pats = barcode_filename_patterns(s.barcode)
+        bam_name_clauses = " -o ".join(f'-name "*{p}*.bam"' for p in pats)
         body += textwrap.dedent(
             f"""
-            # ---- {s.sample} (barcode {s.barcode}) ----
+            # ---- {s.sample} (barcode {s.barcode}, matches: {", ".join(pats)}) ----
             if [ -d {out_dir} ] && [ -n "$(ls -A {out_dir} 2>/dev/null)" ]; then
                 log_event SKIP "{s.sample} (MIJAMP output dir not empty)"
             else
                 # Locate the per-barcode BAM. dorado demux with --no-classify
                 # writes one BAM per BC tag, with the barcode label in the name.
-                bam_file=$(find {layout.bams} -maxdepth 2 -type f -name "*{s.barcode}*.bam" 2>/dev/null | head -1)
+                # Accept both NB13 and barcode13 naming conventions. Don't
+                # cap recursion depth — older runs may have MinKNOW-style
+                # nested layout from before s02b's flatten step existed.
+                bam_file=$(find {layout.bams} -type f \\( {bam_name_clauses} \\) 2>/dev/null | head -1)
                 if [ -z "$bam_file" ]; then
-                    log_event WARN "{s.sample}: no demux BAM matching '{s.barcode}' in {layout.bams}, skipping"
+                    log_event WARN "{s.sample}: no demux BAM matching any of: {', '.join(pats)}, skipping"
                     STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                 elif [ ! -s {fna} ]; then
                     log_event WARN "{s.sample}: Bakta .fna missing ({fna}), skipping"

@@ -11,6 +11,8 @@ publication-ready plots and per-sample summary tables.
 - `generate_pipeline.py` — emits all SGE submit scripts for a given run
 - `pipeline_config.yaml` — paths, models, conda envs, SGE resources, filter thresholds
 - `samplesheet_template.tsv` — fill in one row per barcode
+- `build_type_strain_db.py` — run on an internet-connected machine to fetch
+  RefSeq type-strain proteomes for `--proteins` (see "Type-strain proteomes")
 
 ## One-shot install (all environments)
 
@@ -140,9 +142,37 @@ TSV with these columns (header required, order doesn't matter):
 | column              | meaning                                                            |
 |---------------------|--------------------------------------------------------------------|
 | `kingdom`           | not used by Bakta; kept for back-compat with old samplesheets       |
-| `reference_proteins`| path to a `.gbk` reference; emits `--proteins <path>` when present |
+| `reference_proteins`| your own `--proteins` reference — see below                        |
 | `gram`              | `pos` / `neg` / `unknown` — maps to Bakta `--gram +/-/?`           |
 | `plasmid`           | plasmid name — emits `--plasmid <name>` when present               |
+
+### Supplying your own `--proteins` reference
+
+Put an absolute path in `reference_proteins` and it is passed straight to
+whichever annotator runs for that sample:
+
+- **Amino-acid FASTA (`.faa`) and GenBank (`.gbk`) both work**, for both
+  Bakta and Prokka — the same column covers bacterial and archaeal samples,
+  so you do not need to know in advance which tool will be chosen.
+- **Plain FASTA headers are fine; the pipeline reformats them if needed.**
+  Bakta requires headers shaped `>SeqID~~~gene~~~product~~~dbxref` and
+  silently discards every record that isn't (`skipped incorrectly formatted
+  user proteins: N, imported: 0`, followed by a diamond crash). A normal
+  RefSeq header such as
+  `>WP_000123456.1 chorismate mutase [Escherichia coli]` therefore has to be
+  rewritten. The annotation stage detects this and writes a converted copy to
+  `<output>/bakta/proteins_prepared/`, which is cached and reused. GenBank
+  input passes through untouched, as does anything already in Bakta's format,
+  and Prokka gets the file as-is because it tolerates plain FASTA.
+- It **overrides** the GTDB-derived RefSeq type-strain proteome. Leave the
+  cell blank to let the pipeline pick the type strain automatically.
+- The path is on the **cluster**, and is checked at run time. If the file is
+  missing the stage logs a warning and annotates without `--proteins` rather
+  than failing.
+
+This column is keyed by sample, so it only covers the Autocycler
+consensuses. MetaBAT2 bins do not exist until the pipeline has run, so they
+always take the automatic type-strain lookup.
 
 ## Running
 
@@ -214,9 +244,9 @@ What each stage looks at to decide whether to skip:
 | `s13_map_reads`   | `mapping/<sample>/flagstat.txt` + `unmapped.fastq` exist                        |
 | `s14_meta_assemble` | `meta_flye/<sample>/assembly.fasta` OR `.skipped_low_reads` sentinel          |
 | `s15_bin`         | `bins/<sample>/.binning_done` sentinel                                          |
-| `s16_annotate`    | `bakta/<id>/<id>.gff3` exists (per consensus AND per metabat2 bin)              |
+| `s16_classify`    | any `gtdbtk/output/gtdbtk.*.summary.tsv` exists (consensuses + bins)            |
 | `s17_checkm2`     | `checkm2/output/quality_report.tsv` exists                                      |
-| `s18_classify`    | any `gtdbtk/output/gtdbtk.*.summary.tsv` exists (consensuses + bins)            |
+| `s18_annotate`    | `bakta/<id>/<id>.gff3` (Bakta) or `.gff` (Prokka), per genome                   |
 | `s19_aggregate`   | `reports/metrics.tsv` always regenerated (cheap; no skip guard)                 |
 | `s20_report`      | `reports/report.html` regenerated each run                                      |
 | `s02b_demux_bam`  | any `bams/*.bam` exists                                                         |
@@ -310,12 +340,107 @@ s01_basecall (GPU)
                                           # (s02b_demux_bam runs in parallel off s01, feeds s21_mijamp)
                                               └─ s14_meta_assemble (Flye --meta on unmapped)
                                                   └─ s15_bin (MetaBAT2)
-                                                      └─ s16_annotate (Bakta on consensuses + bins)
-                                                          └─ s17_checkm2
-                                                              └─ s18_classify (GTDB-Tk, consensuses + bins)
-                                                                  └─ s19_aggregate
+                                                      ├─ s16_classify (GTDB-Tk, consensuses + bins)
+                                                      │      └─ s18_annotate (Bakta / Prokka)
+                                                      └─ s17_checkm2 (consensuses + bins)
+                                                                  └─ s19_aggregate (waits on s17 + s18)
                                                                       └─ s20_report (plots + HTML)
                                                                           └─ s21_mijamp (needs s20 done AND s02b_demux_bam done)
+
+GTDB-Tk and CheckM2 both take the raw assemblies and neither needs the other,
+so they run in parallel. Annotation genuinely depends on classification —
+GTDB-Tk's call decides both which annotator runs and which reference proteome
+is passed to `--proteins`.
+
+## Annotation: Bakta, Prokka, and --proteins
+
+After GTDB-Tk classifies every assembly (consensuses and MetaBAT2 bins alike),
+`s18_annotate` decides per genome:
+
+| GTDB-Tk domain | annotator | notes                                    |
+|----------------|-----------|------------------------------------------|
+| Bacteria       | Bakta     | plus `--gram` / `--plasmid` if in sheet  |
+| Archaea        | Prokka    | `--kingdom Archaea`                      |
+| unclassified   | Bakta     | safer general-purpose default            |
+
+Both tools live in the same conda env (`conda_env_bakta`, default `prokka`).
+
+Every genome gets `--proteins <RefSeq type-strain proteome>` for the species
+GTDB-Tk assigned. Resolution cascades:
+
+1. an explicit `reference_proteins` in the samplesheet — your own `.faa` or
+   `.gbk`, applied whether the genome is routed to Bakta or Prokka (wins)
+2. exact species match in the local type-strain index
+3. species match after stripping GTDB placeholder suffixes
+   (`Methanobrevibacter_A smithii` → `Methanobrevibacter smithii`)
+4. any type strain in the same genus
+5. nothing — the genome is annotated without `--proteins`, and the species is
+   appended to `bakta/missing_species.txt`
+
+Organism metadata (`--genus` / `--species` / `--strain`) comes from the
+samplesheet for isolate consensuses and from GTDB-Tk for bins.
+
+### Type-strain proteomes (offline, two-phase)
+
+The cluster has no internet, so the proteomes have to be fetched elsewhere
+and copied in. `build_type_strain_db.py` does that.
+
+**Phase 1 — run the pipeline once.** GTDB-Tk classifies everything;
+`s18_annotate` annotates without `--proteins` and writes
+`<output>/bakta/missing_species.txt`.
+
+**Phase 2 — build the DB on a machine with internet:**
+
+```bash
+python3 build_type_strain_db.py \
+    --from-gtdbtk <output>/gtdbtk/output/gtdbtk.bac120.summary.tsv \
+    --from-gtdbtk <output>/gtdbtk/output/gtdbtk.ar53.summary.tsv \
+    --out-dir ./type_strain_db
+
+# or, driven by what the pipeline said it was missing:
+python3 build_type_strain_db.py \
+    --species-list missing_species.txt \
+    --out-dir ./type_strain_db
+```
+
+It parses NCBI's `assembly_summary_refseq.txt`, keeps only assemblies flagged
+as type material (preferring `assembly from type material` > synonym >
+pathotype > neotype, then Complete Genome > Chromosome > Scaffold > Contig),
+and downloads each `*_protein.faa.gz`. Repeat runs are additive, so you can
+keep topping the collection up as new species show up.
+
+Then copy it to the cluster:
+
+```bash
+rsync -av ./type_strain_db/ <cluster>:/ebio/abt3_scratch/$USER/type_strain_db/
+```
+
+**You usually don't need to touch the config.** If `type_strain_db_dir` is
+empty, the annotation stage searches these locations at runtime and adopts
+the first one containing a valid `index.tsv`:
+
+1. `<output-dir>/type_strain_db` (always tried first)
+2. everything in `type_strain_db_search_paths`, which defaults to
+   `/ebio/abt3_scratch/$USER/type_strain_db`,
+   `/ebio/abt3_projects2/Gut_nanopore/data/type_strain_db`, and
+   `~/type_strain_db`
+
+An explicit `type_strain_db_dir` still wins when it's usable; if it points
+somewhere without an `index.tsv` the stage logs a warning and falls back to
+the search list rather than silently annotating without `--proteins`. The
+log records which DB was used and how it was found:
+
+```
+[OK] s18_annotate type_strain_db: /ebio/abt3_scratch/jmarsh/type_strain_db (auto-discovered existing DB)
+```
+
+Then delete `<output>/bakta/` and re-run; annotation picks up the proteomes.
+Everything upstream (assembly, classification) skips.
+
+Re-running `build_type_strain_db.py` against an existing directory is
+additive and safe: entries already present are reused, entries whose `.faa`
+has gone missing are re-fetched, and only genuinely new species are
+downloaded.
 ```
 
 ## Assumptions

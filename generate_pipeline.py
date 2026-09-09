@@ -268,6 +268,20 @@ def cuda_block(cfg: dict) -> str:
     ).strip()
 
 
+def demux_classify_flag(cfg: dict) -> str:
+    """Return the barcode-classification flag for the demux stages.
+
+    Default is --no-classify, which trusts the BC tags dorado wrote during
+    basecalling. With demux_reclassify: true, demux instead re-scans the
+    reads against demux_kit_name (falling back to kit_name) — this is how you
+    change the barcode kit without re-running the GPU-expensive basecall.
+    """
+    if cfg.get("demux_reclassify", False):
+        kit = cfg.get("demux_kit_name") or cfg["kit_name"]
+        return f"--kit-name {kit}"
+    return "--no-classify"
+
+
 def conda_block(env: str) -> str:
     return textwrap.dedent(
         f"""
@@ -289,10 +303,22 @@ def log_setup(name: str, layout: "Layout") -> str:
         STAGE_FAIL_COUNT=0
         log_event() {{
             local level="$1"; shift
-            local ts
+            local ts line
             ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            printf '%s [%s] %s %s\\n' "$ts" "$level" "$JOB_NAME" "$*" >> "$PIPELINE_LOG"
-            printf '%s [%s] %s %s\\n' "$ts" "$level" "$JOB_NAME" "$*" >&2
+            line="$(printf '%s [%s] %s %s' "$ts" "$level" "$JOB_NAME" "$*")"
+            # Serialise the append. Dozens of s06 batch jobs write to this one
+            # file concurrently, and appends are NOT atomic on NFS — without a
+            # lock, lines get interleaved or silently dropped (which made
+            # pipeline_status.sh report phantom "stalled" stages).
+            if command -v flock >/dev/null 2>&1; then
+                (
+                    flock -w 15 9 2>/dev/null || true
+                    printf '%s\\n' "$line" >> "$PIPELINE_LOG"
+                ) 9>>"$PIPELINE_LOG.lock"
+            else
+                printf '%s\\n' "$line" >> "$PIPELINE_LOG"
+            fi
+            printf '%s\\n' "$line" >&2
         }}
         log_warn_errors_from() {{
             local f="$1"
@@ -311,12 +337,37 @@ def log_setup(name: str, layout: "Layout") -> str:
             #   - our own log events ([SCAN], [WARN], etc.) to prevent
             #     feedback loops when stage stderr is captured into stage log
             grep -nE '(ERROR:|Error:|FATAL:|Fatal:|FAIL:|panic:|Segmentation fault|core dumped|^Killed$)' "$f" 2>/dev/null \\
-                | grep -viE '(error[_ ]?rate|error[_ ]detection|error[_ ]adjustment|error[_ ]threshold|fraction[_ ]error|error[_ ]correction|nextDenovo|cns_align|Re-write workdir|empty job|log\\.critical|\\.tmpfrunt|sgs_fofn|hifi_fofn|Delete task:|plassembler|Unicycler has failed|no plasmids|uncorrected reads|Canu failed to correct|\\[(SCAN|WARN|OK|SKIP|START|DONE|FAIL|INFO|SUMMARY)\\])' \\
+                | grep -viE '(error[_ ]?rate|error[_ ]detection|error[_ ]adjustment|error[_ ]threshold|fraction[_ ]error|error[_ ]correction|nextDenovo|cns_align|Re-write workdir|empty job|log\\.critical|\\.tmpfrunt|sgs_fofn|hifi_fofn|Delete task:|plassembler|Unicycler has failed|no plasmids|uncorrected reads|Canu failed to correct|pymp-|_remove_temp_dir|multiprocessing/util|Device or resource busy|\\[(SCAN|WARN|OK|SKIP|START|DONE|FAIL|INFO|SUMMARY)\\])' \\
                 | head -20 \\
                 | sed -E 's/\\x1B\\[[0-9;]*[mGK]//g' \\
                 | while IFS= read -r line; do
                     log_event SCAN "$line"
                 done
+        }}
+        # samtools 0.1.x parses `sort -o out.bam -` as input=out.bam (in 0.1.x
+        # -o is a boolean meaning "write to stdout"), so it tries to READ the
+        # not-yet-existent output and dies with ENOENT, which in turn SIGPIPEs
+        # minimap2 (rc=141). Catch that here rather than emitting confusing
+        # "[bam_sort_core] fail to open file" errors.
+        check_samtools() {{
+            local envname="${{1:-this}}"
+            if ! command -v samtools >/dev/null 2>&1; then
+                log_event WARN "samtools not found on PATH in the '$envname' conda env"
+                return 1
+            fi
+            local ver major
+            ver=$(samtools --version 2>/dev/null | head -1 | awk '{{print $2}}')
+            if [ -z "$ver" ]; then
+                log_event WARN "samtools in '$envname' is pre-1.0 (no --version support). This pipeline needs samtools >= 1.10 — 0.1.x parses 'sort -o out.bam -' backwards. Fix with: mamba install -n $envname -c bioconda -c conda-forge 'samtools>=1.18'"
+                return 1
+            fi
+            major=${{ver%%.*}}
+            if ! [ "$major" -ge 1 ] 2>/dev/null; then
+                log_event WARN "samtools $ver in '$envname' is too old; need >= 1.10. Fix with: mamba install -n $envname -c bioconda -c conda-forge 'samtools>=1.18'"
+                return 1
+            fi
+            log_event OK "samtools $ver"
+            return 0
         }}
         on_exit() {{
             local rc=$?
@@ -469,11 +520,11 @@ def stage_demux(cfg: dict, layout: Layout, hold: str) -> str:
         if find {layout.fastq_raw} -type f \\( -name "*.fastq" -o -name "*.fastq.gz" \\) | grep -q .; then
             log_event SKIP "demux output already present in {layout.fastq_raw}"
         else
-            log_event OK "starting dorado demux"
+            log_event OK "starting dorado demux ({demux_classify_flag(cfg)})"
             set +e
             {cfg['dorado_binary']} demux \\
                 --output-dir {layout.fastq_raw} \\
-                --no-classify \\
+                {demux_classify_flag(cfg)} \\
                 --emit-fastq \\
                 --threads {cfg['sge_pe_parallel']} \\
                 --emit-summary \\
@@ -514,13 +565,19 @@ def stage_demux_bam(cfg: dict, layout: Layout, hold: str) -> str:
     with s02_demux off the same s01_basecall output."""
     name = "s02b_demux_bam"
     body = sge_header(
-        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"],
+        cfg.get("sge_h_vmem_demux_bam", "100G"),
         cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
     )
     body += conda_block(cfg["conda_env_demux"]) + "\n\n"
     body += log_setup(name, layout) + "\n\n"
     body += textwrap.dedent(
         f"""
+        if ! check_samtools "{cfg['conda_env_demux']}"; then
+            log_event WARN "aborting s02b — samtools >= 1.10 is required to sort/index the demuxed BAMs"
+            exit 1
+        fi
+
         mkdir -p {layout.bams}
 
         # Resume if any *.bam already exists in the demux BAM dir.
@@ -530,14 +587,19 @@ def stage_demux_bam(cfg: dict, layout: Layout, hold: str) -> str:
             log_event WARN "basecalls.bam missing, cannot demux to BAM"
             STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
         else
-            log_event OK "starting dorado demux (BAM, --sort-bam, preserves MM/ML)"
+            log_event OK "starting dorado demux (BAM, preserves MM/ML, {demux_classify_flag(cfg)})"
             set +e
+            # NOTE: dorado's own --sort-bam is deliberately NOT used here. It
+            # is incompatible with --kit-name (re-classification): the stage
+            # exits 1 within seconds and prints nothing. Sorting with samtools
+            # afterwards works in both modes and additionally gives us .bai
+            # indexes, which dorado --sort-bam does not produce and which
+            # modkit / MIJAMP need.
             {cfg['dorado_binary']} demux \\
                 --output-dir {layout.bams} \\
-                --no-classify \\
+                {demux_classify_flag(cfg)} \\
                 --threads {cfg['sge_pe_parallel']} \\
                 --emit-summary \\
-                --sort-bam \\
                 {layout.bam_path}
             rc=$?
             set -e
@@ -557,8 +619,35 @@ def stage_demux_bam(cfg: dict, layout: Layout, hold: str) -> str:
                 fi
             done
             find {layout.bams} -mindepth 1 -type d -empty -delete 2>/dev/null || true
+
+            # Sort + index each per-barcode BAM. Replaces dorado --sort-bam
+            # (see note above) and produces the .bai files modkit/MIJAMP need.
+            n_sorted=0
+            n_sort_fail=0
+            for b in {layout.bams}/*.bam; do
+                [ -e "$b" ] || continue
+                case "$b" in *.sorted.bam) continue ;; esac
+                if [ -s "${{b}}.bai" ]; then
+                    continue   # already sorted+indexed by an earlier run
+                fi
+                set +e
+                samtools sort -@ {cfg['sge_pe_parallel']} -o "${{b}}.sorting" "$b" \\
+                    && mv -f "${{b}}.sorting" "$b" \\
+                    && samtools index "$b"
+                src=$?
+                set -e
+                if [ $src -ne 0 ]; then
+                    log_event WARN "samtools sort/index failed for $(basename "$b") rc=$src"
+                    rm -f "${{b}}.sorting"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    n_sort_fail=$((n_sort_fail+1))
+                else
+                    n_sorted=$((n_sorted+1))
+                fi
+            done
+
             n_bams=$(find {layout.bams} -maxdepth 1 -type f -name "*.bam" | wc -l)
-            log_event OK "demux (BAM) produced $n_bams files"
+            log_event OK "demux (BAM) produced $n_bams files (sorted+indexed: $n_sorted, failed: $n_sort_fail)"
         fi
 
         log_warn_errors_from "$STAGE_LOG"
@@ -609,8 +698,17 @@ def stage_rename(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
                             *)    cat  "$f" >> {out} ;;
                         esac
                     done
-                    nlines=$(wc -l < {out})
-                    log_event OK "{s.sample} wrote $nlines lines"
+                    # Report reads/bases/depth now rather than letting a
+                    # low-coverage sample fail opaquely at s05_subsample.
+                    nreads=$(awk 'NR%4==1' {out} | wc -l)
+                    nbases=$(awk 'NR%4==2 {{s+=length($0)}} END {{print s+0}}' {out})
+                    depth=$(awk -v b="$nbases" -v g={s.genome_length} \\
+                        'BEGIN {{printf "%.2f", (g>0 ? b/g : 0)}}')
+                    log_event OK "{s.sample} reads=$nreads bases=$nbases depth=${{depth}}x"
+                    if awk -v d="$depth" 'BEGIN {{exit !(d < 25)}}'; then
+                        log_event WARN "{s.sample}: depth ${{depth}}x is below autocycler's 25x minimum — this sample WILL fail at s05_subsample. Check that barcode {s.barcode} actually carried library material."
+                        STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    fi
                 fi
             fi
 
@@ -1150,112 +1248,233 @@ def stage_collect(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -
     return name
 
 
-# ---- s13 annotate --------------------------------------------------------
+# ---- s18 annotate (Bakta for Bacteria, Prokka for Archaea) --------------
 
 def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
-    name = "s16_annotate"
+    """Annotate every assembly, choosing BOTH the annotator and the --proteins
+    reference from GTDB-Tk's classification.
+
+        Bacteria -> bakta  --proteins <RefSeq type-strain proteome>
+        Archaea  -> prokka --kingdom Archaea --proteins <same>
+
+    The per-genome decisions are made by _resolve_annotation_plan.py, which
+    runs first inside this stage and writes annotation_plan.tsv. The
+    type-strain proteomes come from a LOCAL directory built offline by
+    build_type_strain_db.py (the cluster has no internet access).
+    """
+    name = "s18_annotate"
     body = sge_header(
         name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
         cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
     )
+    # Bakta and Prokka live in the same conda env.
     body += conda_block(cfg["conda_env_bakta"]) + "\n\n"
     body += log_setup(name, layout) + "\n\n"
-    body += f"mkdir -p {layout.annotate}\n\n"
-    bakta_min_len = int(cfg.get("bakta_min_contig_length", 200))
-    bakta_threads = int(cfg.get("bakta_threads", 20))
-    for s in samples:
-        # Build optional flags conditionally so they're only present when
-        # the samplesheet supplied a value. Each flag is on its own line with
-        # the same continuation indentation as the other bakta flags so the
-        # generated script reads cleanly.
-        opt_flags: List[str] = []
-        if s.plasmid:
-            opt_flags.append(f"--plasmid {s.plasmid}")
-        if s.gram:
-            opt_flags.append(f"--gram {GRAM_MAP[s.gram]}")
-        if s.reference_proteins:
-            opt_flags.append(f"--proteins {s.reference_proteins}")
-        # Indented to match the other --flag lines after textwrap.dedent
-        # strips the common leading whitespace.
-        opt_lines = "".join(f"        {flag} \\\n" for flag in opt_flags)
 
-        out_dir = f"{layout.annotate}/{s.sample}"
-        marker = f"{out_dir}/{s.sample}.gff3"
-        body += textwrap.dedent(
-            f"""\
-            if [ -s {marker} ]; then
-                log_event SKIP "{s.sample} (bakta .gff3 exists)"
-            elif [ ! -s {layout.consensus}/{s.sample}.fasta ]; then
-                log_event WARN "{s.sample}: consensus fasta missing"
-                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
-            else
-                set +e
-                bakta \\
-                    --db {cfg['bakta_db']} \\
-                    --min-contig-length {bakta_min_len} \\
-                    --prefix {s.sample} \\
-                    --output {out_dir} \\
-                    --genus {s.genus} \\
-                    --species {s.species} \\
-                    --strain {s.strain} \\
-            """
-        ) + opt_lines + textwrap.dedent(
-            f"""\
-                    --threads {bakta_threads} \\
-                    --force \\
-                    {layout.consensus}/{s.sample}.fasta
-                rc=$?
-                set -e
-                if [ $rc -ne 0 ]; then
-                    log_event WARN "{s.sample}: bakta rc=$rc"
-                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
-                else
-                    log_event OK "{s.sample} annotated"
-                fi
-            fi
+    # Standalone resolver, written once next to the submit scripts.
+    plan_py = layout.submit_dir / "_resolve_annotation_plan.py"
+    plan_py.write_text(ANNOTATION_PLAN_PY)
+    plan_py.chmod(plan_py.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-            """
-        )
-    # Also run Bakta on every MetaBAT2 bin. Bins are putative MAGs of
-    # unknown taxonomy, so we pass only --strain <bin_id> for traceability
-    # and let Bakta annotate without --genus/--species/--proteins/--gram.
-    # Output goes to bakta/<bin_id>/ in parallel with the consensus outputs.
+    # Curated samplesheet metadata, for the isolate consensuses.
+    meta_path = layout.annotate / "sample_meta.tsv"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    with meta_path.open("w") as fh:
+        fh.write("sample\tgenus\tspecies\tstrain\tkingdom\tgram\tplasmid\treference_proteins\n")
+        for s in samples:
+            fh.write("\t".join([
+                s.sample, s.genus, s.species, s.strain, s.kingdom,
+                s.gram, s.plasmid, s.reference_proteins,
+            ]) + "\n")
+
+    plan     = f"{layout.annotate}/annotation_plan.tsv"
+    missing  = f"{layout.annotate}/missing_species.txt"
+    resolver_out = f"{layout.annotate}/plan_resolver.out"
+    min_len  = int(cfg.get("bakta_min_contig_length", 200))
+    threads  = int(cfg.get("bakta_threads", 20))
+    ts_db    = cfg.get("type_strain_db_dir", "") or ""
+
+    # Candidate locations searched on the cluster at runtime when
+    # type_strain_db_dir is unset (or points somewhere unusable). The first
+    # one holding a valid index.tsv is adopted, so a DB built and rsync'd
+    # earlier gets picked up without editing the config.
+    search_paths: List[str] = [f"{layout.root}/type_strain_db"]
+    search_paths += [str(p) for p in cfg.get("type_strain_db_search_paths", []) or []]
+    ts_search = os.pathsep.join(search_paths)
+
     body += textwrap.dedent(
         f"""
+        mkdir -p {layout.annotate}
 
-        # ---- Bakta on MetaBAT2 bins ----
-        for bin_fa in {layout.bins}/*/*.fa; do
-            [ -e "$bin_fa" ] || continue
-            bin_id=$(basename "$bin_fa" .fa)
-            out_dir={layout.annotate}/${{bin_id}}
-            marker=${{out_dir}}/${{bin_id}}.gff3
-            if [ -s "$marker" ]; then
-                log_event SKIP "${{bin_id}} (bakta .gff3 exists)"
+        log_event OK "resolving annotation plan from GTDB-Tk classifications"
+        set +e
+        python3 {plan_py} \\
+            --gtdbtk-dir {layout.gtdbtk}/output \\
+            --consensus-dir {layout.consensus} \\
+            --bins-dir {layout.bins} \\
+            --annotate-dir {layout.annotate} \\
+            --type-strain-db "{ts_db}" \\
+            --type-strain-search "{ts_search}" \\
+            --sample-meta {meta_path} \\
+            --out-plan {plan} \\
+            --out-missing {missing} \\
+            > {resolver_out} 2>&1
+        rc=$?
+        set -e
+        cat {resolver_out} >&2
+        if [ $rc -ne 0 ] || [ ! -s {plan} ]; then
+            log_event WARN "could not build annotation plan (rc=$rc)"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 1
+        fi
+        # Surface which type-strain DB was actually used (config vs discovered).
+        ts_line=$(grep -m1 '^type_strain_db:' {resolver_out} || true)
+        [ -n "$ts_line" ] && log_event OK "$ts_line"
+        if grep -q '^type_strain_db: none found' {resolver_out}; then
+            log_event WARN "no type-strain DB found — annotating WITHOUT --proteins. Build one with build_type_strain_db.py (see README) and drop it at {layout.root}/type_strain_db, or set type_strain_db_dir."
+        fi
+        log_event OK "annotation plan: $(tail -n +2 {plan} | wc -l) genomes"
+        if [ -s {missing} ]; then
+            log_event WARN "$(wc -l < {missing}) species have no local type-strain proteome. See {missing} — run build_type_strain_db.py on an internet-connected machine, rsync the result over, and re-run this stage."
+        fi
+
+        # Walk the plan. Process substitution (not a pipe) so the loop runs in
+        # this shell and STAGE_FAIL_COUNT survives.
+        while IFS=$'\\t' read -r gid fasta atype domain tool genus epithet strain gram plasmid gtdb_sp proteins psrc out_dir; do
+            [ -n "$gid" ] || continue
+            # The plan writes __NONE__ for empty fields so that consecutive
+            # tabs never collapse (bash treats tab as IFS-whitespace and would
+            # otherwise shift every subsequent column left). Undo that here.
+            for _v in gid fasta atype domain tool genus epithet strain gram \\
+                      plasmid gtdb_sp proteins psrc out_dir; do
+                # Belt and braces: strip any stray carriage return (a CRLF
+                # plan would otherwise leave \\r on the final column and we
+                # would silently create paths ending in a control character).
+                printf -v "$_v" '%s' "${{!_v%$'\\r'}}"
+                [ "${{!_v}}" = "__NONE__" ] && printf -v "$_v" '%s' ""
+            done
+
+            if [ "$tool" = "prokka" ]; then
+                marker="$out_dir/${{gid}}.gff"
             else
-                set +e
+                marker="$out_dir/${{gid}}.gff3"
+            fi
+
+            if [ -s "$marker" ]; then
+                log_event SKIP "$gid ($tool output exists)"
+                continue
+            fi
+            if [ ! -s "$fasta" ]; then
+                log_event WARN "$gid: input fasta missing ($fasta)"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                continue
+            fi
+
+            # --proteins only if the resolved file actually exists on disk
+            prot_flag=""
+            if [ -n "$proteins" ] && [ -s "$proteins" ]; then
+                prot_flag="--proteins $proteins"
+            elif [ -n "$proteins" ]; then
+                log_event WARN "$gid: proteins file listed but missing ($proteins), annotating without it"
+            fi
+
+            genus_flag=""
+            [ -n "$genus" ]   && genus_flag="--genus $genus"
+            species_flag=""
+            [ -n "$epithet" ] && species_flag="--species $epithet"
+            strain_flag=""
+            [ -n "$strain" ]  && strain_flag="--strain $strain"
+
+            rm -rf "$out_dir"
+            mkdir -p "$out_dir"
+            set +e
+            if [ "$tool" = "prokka" ]; then
+                log_event OK "$gid: prokka (Archaea, ${{gtdb_sp:-unclassified}}, proteins=$psrc)"
+                prokka \\
+                    --outdir "$out_dir" \\
+                    --prefix "$gid" \\
+                    --locustag "$gid" \\
+                    --kingdom Archaea \\
+                    $genus_flag $species_flag $strain_flag \\
+                    $prot_flag \\
+                    --cpus {threads} \\
+                    --force \\
+                    "$fasta"
+                arc=$?
+            else
+                gram_flag=""
+                case "$gram" in
+                    pos) gram_flag="--gram +" ;;
+                    neg) gram_flag="--gram -" ;;
+                    unknown) gram_flag="--gram ?" ;;
+                esac
+                plasmid_flag=""
+                [ -n "$plasmid" ] && plasmid_flag="--plasmid $plasmid"
+                log_event OK "$gid: bakta (${{domain:-unknown}}, ${{gtdb_sp:-unclassified}}, proteins=$psrc)"
                 bakta \\
                     --db {cfg['bakta_db']} \\
-                    --min-contig-length {bakta_min_len} \\
-                    --prefix "$bin_id" \\
+                    --min-contig-length {min_len} \\
+                    --prefix "$gid" \\
                     --output "$out_dir" \\
-                    --strain "$bin_id" \\
-                    --threads {bakta_threads} \\
+                    $genus_flag $species_flag $strain_flag \\
+                    $gram_flag $plasmid_flag \\
+                    $prot_flag \\
+                    --threads {threads} \\
                     --force \\
-                    "$bin_fa"
-                rc=$?
-                set -e
-                if [ $rc -ne 0 ]; then
-                    log_event WARN "$bin_id: bakta rc=$rc"
-                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    "$fasta"
+                arc=$?
+            fi
+            set -e
+
+            # A malformed reference proteome must never cost us the whole
+            # annotation. If the run failed while --proteins was in play,
+            # retry once without it — an annotation without the extra
+            # evidence is far better than none.
+            if {{ [ $arc -ne 0 ] || [ ! -s "$marker" ]; }} && [ -n "$prot_flag" ]; then
+                log_event WARN "$gid: $tool failed (rc=$arc) with --proteins; retrying without it"
+                rm -rf "$out_dir"; mkdir -p "$out_dir"
+                set +e
+                if [ "$tool" = "prokka" ]; then
+                    prokka \\
+                        --outdir "$out_dir" \\
+                        --prefix "$gid" \\
+                        --locustag "$gid" \\
+                        --kingdom Archaea \\
+                        $genus_flag $species_flag $strain_flag \\
+                        --cpus {threads} \\
+                        --force \\
+                        "$fasta"
+                    arc=$?
                 else
-                    log_event OK "$bin_id annotated (bin)"
+                    bakta \\
+                        --db {cfg['bakta_db']} \\
+                        --min-contig-length {min_len} \\
+                        --prefix "$gid" \\
+                        --output "$out_dir" \\
+                        $genus_flag $species_flag $strain_flag \\
+                        $gram_flag $plasmid_flag \\
+                        --threads {threads} \\
+                        --force \\
+                        "$fasta"
+                    arc=$?
+                fi
+                set -e
+                if [ $arc -eq 0 ] && [ -s "$marker" ]; then
+                    log_event WARN "$gid annotated by $tool WITHOUT --proteins (the reference at $proteins was rejected — check its format)"
                 fi
             fi
-        done
 
+            if [ $arc -ne 0 ] || [ ! -s "$marker" ]; then
+                log_event WARN "$gid: $tool failed (rc=$arc)"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                log_event OK "$gid annotated by $tool"
+            fi
+        done < <(tail -n +2 {plan})
+
+        log_warn_errors_from "$STAGE_LOG"
         """
-    )
-    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    ).strip() + "\n"
     write_script(layout.submit_dir / f"{name}.sh", body)
     return name
 
@@ -1265,20 +1484,40 @@ def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
 def stage_map_reads(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
     name = "s13_map_reads"
     body = sge_header(
-        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"],
+        cfg.get("sge_h_vmem_mapping", "100G"),
         cfg["sge_pe_parallel"], cfg["email"], hold_jid=hold,
     )
     body += conda_block(cfg["conda_env_mapping"]) + "\n\n"
     body += log_setup(name, layout) + "\n\n"
     threads = int(cfg.get("minimap2_threads", 20))
+    body += textwrap.dedent(
+        f"""
+        if ! check_samtools "{cfg['conda_env_mapping']}"; then
+            log_event WARN "aborting s13 — a working samtools >= 1.10 is required"
+            exit 1
+        fi
+        if ! command -v minimap2 >/dev/null 2>&1; then
+            log_event WARN "minimap2 not found in the '{cfg['conda_env_mapping']}' env"
+            exit 1
+        fi
+
+        """
+    )
     body += f"mkdir -p {layout.mapping}\n\n"
     for s in samples:
         sdir = f"{layout.mapping}/{s.sample}"
         marker = f"{sdir}/flagstat.txt"
+        # Resume marker is a .done sentinel, NOT the presence of unmapped.fastq:
+        # a deeply-sequenced isolate can legitimately have ZERO unmapped reads,
+        # which would make an "-s unmapped.fastq" guard re-run forever.
+        done_marker = f"{sdir}/.mapping_done"
         body += textwrap.dedent(
             f"""
-            mkdir -p {sdir}
-            if [ -s {marker} ] && [ -s {sdir}/unmapped.fastq ]; then
+            if ! mkdir -p {sdir} 2>/dev/null || [ ! -d {sdir} ]; then
+                log_event WARN "{s.sample}: cannot create {sdir} (disk full / quota / permissions?)"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            elif [ -f {done_marker} ] && [ -s {marker} ]; then
                 log_event SKIP "{s.sample} (already mapped)"
             elif [ ! -s {layout.consensus}/{s.sample}.fasta ]; then
                 log_event WARN "{s.sample}: consensus fasta missing, skipping"
@@ -1288,24 +1527,44 @@ def stage_map_reads(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                 STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
             else
                 set +e
+                # pipefail so a minimap2 failure is not masked by samtools sort
+                # exiting 0. minimap2 stderr is kept (previously /dev/null'd,
+                # which hid the real cause of failures).
+                set -o pipefail
                 minimap2 -ax map-ont -t {threads} \\
                     {layout.consensus}/{s.sample}.fasta \\
-                    {layout.fastq_filtered}/{s.sample}.fastq 2>/dev/null \\
+                    {layout.fastq_filtered}/{s.sample}.fastq \\
+                    2> {sdir}/minimap2.stderr \\
                     | samtools sort -@ {threads} -o {sdir}/mapped.bam -
                 rc=$?
-                if [ $rc -eq 0 ]; then
+                set +o pipefail
+                # Never trust rc alone — verify the artifact actually exists.
+                # samtools has been observed exiting 0 after failing to create
+                # its output file, which previously produced a bogus [OK].
+                if [ $rc -ne 0 ] || [ ! -s {sdir}/mapped.bam ]; then
+                    log_event WARN "{s.sample}: mapping failed (rc=$rc, mapped.bam missing/empty)"
+                    if [ -s {sdir}/minimap2.stderr ]; then
+                        log_event WARN "{s.sample}: minimap2 said: $(tail -3 {sdir}/minimap2.stderr | tr '\\n' ' ')"
+                    fi
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                else
                     samtools index {sdir}/mapped.bam
                     samtools flagstat {sdir}/mapped.bam > {marker}
-                    # Extract unmapped reads as fastq (-f 4 selects unmapped)
+                    # -f 4 selects unmapped records
                     samtools fastq -f 4 {sdir}/mapped.bam > {sdir}/unmapped.fastq 2>/dev/null
                     mapped=$(grep -E '[0-9]+ \\+ [0-9]+ mapped \\(' {marker} | head -1 | awk '{{print $1}}')
                     total=$(head -1 {marker} | awk '{{print $1}}')
-                    unmapped=$(grep -cE '^@|^>' {sdir}/unmapped.fastq 2>/dev/null || echo 0)
-                    unmapped_reads=$(awk 'NR%4==1' {sdir}/unmapped.fastq | wc -l)
-                    log_event OK "{s.sample} mapped=$mapped/$total unmapped_reads=$unmapped_reads"
-                else
-                    log_event WARN "{s.sample}: minimap2/samtools rc=$rc"
-                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    unmapped_reads=$(awk 'NR%4==1' {sdir}/unmapped.fastq 2>/dev/null | wc -l)
+                    # Guard against an unparseable/empty flagstat
+                    if [ -z "$mapped" ] || [ -z "$total" ]; then
+                        log_event WARN "{s.sample}: could not parse flagstat ({marker} empty or malformed)"
+                        STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    else
+                        pct=$(awk -v m="$mapped" -v t="$total" \\
+                            'BEGIN {{printf "%.2f", (t>0 ? 100*m/t : 0)}}')
+                        log_event OK "{s.sample} mapped=$mapped/$total (${{pct}}%) unmapped_reads=$unmapped_reads"
+                        touch {done_marker}
+                    fi
                 fi
                 set -e
             fi
@@ -1388,6 +1647,15 @@ def stage_bin(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> st
     body += log_setup(name, layout) + "\n\n"
     threads = int(cfg.get("minimap2_threads", 20))
     min_contig = int(cfg.get("metabat_min_contig", 1500))
+    body += textwrap.dedent(
+        f"""
+        if ! check_samtools "{cfg['conda_env_metabat']}"; then
+            log_event WARN "aborting s15 — samtools >= 1.10 is required to build the depth BAM"
+            exit 1
+        fi
+
+        """
+    )
     body += f"mkdir -p {layout.bins}\n\n"
     for s in samples:
         meta_asm = f"{layout.meta_flye}/{s.sample}/assembly.fasta"
@@ -1455,8 +1723,25 @@ def stage_checkm2(cfg: dict, layout: Layout, hold: str) -> str:
     marker = f"{out_dir}/quality_report.tsv"
     if db:
         body += f'export CHECKM2DB="{db}"\n'
+    ck_tmp = cfg.get("checkm2_tmpdir", "") or ""
     body += textwrap.dedent(
         f"""
+
+        # Keep python multiprocessing's temp dir OFF NFS. Deleting a
+        # still-open file on NFS becomes a "silly rename" that cannot be
+        # unlinked, so CheckM2's shutdown finaliser throws
+        #   OSError: [Errno 16] Device or resource busy: .../pymp-XXXX
+        # after it has already written quality_report.tsv. Results are fine,
+        # but it is noisy and leaves stale pymp-* dirs on scratch.
+        CK_TMP="{ck_tmp}"
+        [ -n "$CK_TMP" ] || CK_TMP="/tmp/checkm2.$$"
+        if mkdir -p "$CK_TMP" 2>/dev/null; then
+            export TMPDIR="$CK_TMP"
+            log_event OK "TMPDIR=$TMPDIR (node-local, avoids NFS unlink errors)"
+        else
+            log_event WARN "could not create $CK_TMP; leaving TMPDIR=${{TMPDIR:-/tmp}} (expect benign pymp-* unlink tracebacks)"
+            CK_TMP=""
+        fi
 
         if [ -s {marker} ]; then
             log_event SKIP "checkm2 quality_report.tsv already exists"
@@ -1500,6 +1785,11 @@ def stage_checkm2(cfg: dict, layout: Layout, hold: str) -> str:
             fi
         fi
 
+        # Tidy our node-local temp dir (and any pymp-* left behind on it).
+        if [ -n "${{CK_TMP:-}}" ] && [ -d "$CK_TMP" ]; then
+            rm -rf "$CK_TMP" 2>/dev/null || true
+        fi
+
         log_warn_errors_from "$STAGE_LOG"
         """
     ).strip() + "\n"
@@ -1510,7 +1800,7 @@ def stage_checkm2(cfg: dict, layout: Layout, hold: str) -> str:
 # ---- s18 GTDB-Tk classification (consensuses + bins) --------------------
 
 def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
-    name = "s18_classify"
+    name = "s16_classify"
     body = sge_header(
         name, layout.stdout_dir, cfg["sge_h_rt_cpu"],
         cfg.get("sge_h_vmem_gtdbtk", "100G"),
@@ -1533,20 +1823,28 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
     body += textwrap.dedent(
         f"""
 
-        # Build the GTDB-Tk batchfile from BOTH Bakta annotated consensuses AND
-        # MetaBAT2 bins. Format: <fasta_path>\\t<genome_id>
-        # Bin IDs are <sample>_bin.N so origin sample is identifiable downstream.
+        # Build the GTDB-Tk batchfile from the Autocycler consensuses and the
+        # MetaBAT2 bins DIRECTLY — not from Bakta's .fna.
+        #
+        # GTDB-Tk calls genes itself (Prodigal) and only needs nucleotide
+        # FASTA, so depending on Bakta bought nothing while forcing GTDB-Tk to
+        # queue behind ~1h of annotation and making classification fail
+        # whenever annotation did.
+        #
+        # Format: <fasta_path>\\t<genome_id>
+        # Bin IDs are <sample>_bin.N so origin sample is traceable in the
+        # GTDB-Tk summary rows.
         : > {batchfile}
         """
     )
     for s in samples:
-        fna = f"{layout.annotate}/{s.sample}/{s.sample}.{ext}"
+        cons = f"{layout.consensus}/{s.sample}.fasta"
         body += textwrap.dedent(
             f"""
-            if [ -s {fna} ]; then
-                printf '%s\\t%s\\n' '{fna}' '{s.sample}' >> {batchfile}
+            if [ -s {cons} ]; then
+                printf '%s\\t%s\\n' '{cons}' '{s.sample}' >> {batchfile}
             else
-                log_event WARN "{s.sample}: missing bakta output ({fna}), excluded from GTDB-Tk"
+                log_event WARN "{s.sample}: missing consensus ({cons}), excluded from GTDB-Tk"
                 STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
             fi
             """
@@ -1554,24 +1852,17 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
     body += textwrap.dedent(
         f"""
 
-        # Add every MetaBAT2 bin. Prefer the Bakta-annotated .{ext} (cleaner
-        # headers), fall back to the raw .fa if Bakta hasn't run on the bin.
-        # Genome ID is <sample>_bin.N so origin is traceable in GTDB-Tk rows.
+        # Add every MetaBAT2 bin (raw output — no annotation needed).
         for f in {layout.bins}/*/*.fa; do
             [ -e "$f" ] || continue
             genome_id=$(basename "$f" .fa)
-            bakta_fna={layout.annotate}/${{genome_id}}/${{genome_id}}.{ext}
-            if [ -s "$bakta_fna" ]; then
-                printf '%s\\t%s\\n' "$bakta_fna" "$genome_id" >> {batchfile}
-            else
-                printf '%s\\t%s\\n' "$f" "$genome_id" >> {batchfile}
-            fi
+            printf '%s\\t%s\\n' "$f" "$genome_id" >> {batchfile}
         done
 
         n_entries=$(wc -l < {batchfile})
         log_event OK "GTDB-Tk batchfile has $n_entries entries (consensuses + bins)"
         if [ "$n_entries" -eq 0 ]; then
-            log_event WARN "no Bakta outputs found, skipping GTDB-Tk entirely"
+            log_event WARN "no assemblies found, skipping GTDB-Tk entirely"
             exit 0
         fi
 
@@ -1702,33 +1993,60 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                 return {{}}
 
         def bakta_feature_counts(p):
-            \"\"\"Try Bakta JSON first; fall back to .txt summary if needed.\"\"\"
+            \"\"\"Feature counts from whichever annotator ran.
+
+            Bakta writes <prefix>.json (preferred) and <prefix>.txt.
+            Prokka (used for Archaea) writes only <prefix>.txt, in the form
+                CDS: 4200
+                tRNA: 86
+            Both live at <annotate_dir>/<genome_id>/<genome_id>.*
+            \"\"\"
             sample_dir = p.parent
             stem = p.stem
-            j = sample_dir / f"{{stem}}.json"
             counts = {{"CDS": 0, "tRNA": 0, "rRNA": 0, "tmRNA": 0,
                       "ncRNA": 0, "CRISPR": 0, "sORF": 0, "oriC": 0, "oriT": 0}}
+            j = sample_dir / f"{{stem}}.json"
             if j.exists():
                 d = load_bakta_json(j)
-                feats = d.get("features", [])
-                for f in feats:
+                for f in d.get("features", []):
                     t = f.get("type", "")
                     if t in counts:
                         counts[t] += 1
                     elif t == "ncRNA-region":
                         counts["ncRNA"] += 1
-                return counts
-            # Fall back to .txt summary if no JSON
+                if any(counts.values()):
+                    return counts
+            # Prokka (or Bakta without JSON): parse the .txt summary.
             t = sample_dir / f"{{stem}}.txt"
             if t.exists():
-                for line in t.read_text().splitlines():
-                    for k in counts:
-                        if line.startswith(k + ":") or line.startswith(k + " "):
-                            try:
-                                counts[k] = int(line.split()[-1])
-                            except Exception:
-                                pass
+                # Prokka keys: CDS, rRNA, tRNA, tmRNA, misc_RNA, repeat_region
+                alias = {{"misc_RNA": "ncRNA", "repeat_region": "CRISPR"}}
+                for line in t.read_text(errors="ignore").splitlines():
+                    if ":" not in line:
+                        continue
+                    k, _, v = line.partition(":")
+                    k = k.strip()
+                    k = alias.get(k, k)
+                    if k in counts:
+                        try:
+                            counts[k] = int(v.strip().split()[0])
+                        except Exception:
+                            pass
             return counts
+
+        def annotator_of(genome_id):
+            \"\"\"Which tool annotated this genome, from annotation_plan.tsv.\"\"\"
+            plan = ROOT / "bakta" / "annotation_plan.tsv"
+            if not plan.exists():
+                return ""
+            try:
+                with plan.open() as fh:
+                    for row in csv.DictReader(fh, delimiter="\\t"):
+                        if (row.get("genome_id") or "").strip() == genome_id:
+                            return (row.get("tool") or "").strip()
+            except Exception:
+                pass
+            return ""
 
         def load_checkm2():
             p = ROOT / "checkm2" / "output" / "quality_report.tsv"
@@ -1922,6 +2240,7 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                 "expected_species": exp_sp,
                 "genus_match": genus_match,
                 "species_match": species_match,
+                "annotator": annotator_of(s),
                 "cds": feats.get("CDS", 0),
                 "tRNA": feats.get("tRNA", 0),
                 "rRNA": feats.get("rRNA", 0),
@@ -1938,10 +2257,20 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                 cmb = checkm2.get(bid, {{}})
                 gtb = gtdbtk.get(bid, {{}})
                 btax = parse_taxonomy(gtb.get("classification", ""))
+                # Bins are annotated too (Bakta or Prokka depending on domain)
+                bfeats = bakta_feature_counts(
+                    ROOT / "bakta" / bid / f"{{bid}}.fna")
                 rows.append({{
                     "sample": s,
                     "assembly_type": "metagenomic_bin",
                     "genome_id": bid,
+                    "annotator": annotator_of(bid),
+                    "cds": bfeats.get("CDS", 0),
+                    "tRNA": bfeats.get("tRNA", 0),
+                    "rRNA": bfeats.get("rRNA", 0),
+                    "tmRNA": bfeats.get("tmRNA", 0),
+                    "ncRNA": bfeats.get("ncRNA", 0),
+                    "CRISPR": bfeats.get("CRISPR", 0),
                     "n_contigs": bn,
                     "genome_length_bp": blen,
                     "longest_contig_bp": blong,
@@ -1971,10 +2300,10 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                   "contamination","classification","domain","phylum","class",
                   "order","family","genus","species","expected_genus",
                   "expected_species","genus_match","species_match",
-                  "cds","tRNA","rRNA","tmRNA","ncRNA","CRISPR"]
-        with OUT.open("w") as fh:
+                  "annotator","cds","tRNA","rRNA","tmRNA","ncRNA","CRISPR"]
+        with OUT.open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=fields, delimiter="\\t",
-                               extrasaction="ignore")
+                               extrasaction="ignore", lineterminator="\\n")
             w.writeheader()
             for r in rows:
                 w.writerow(r)
@@ -1993,6 +2322,423 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
 # Standalone Python script for the report stage. Written to submit_scripts/
 # so that the bash wrapper can just invoke it without an embedded heredoc
 # (and so the report code stays out of the outer-f-string brace minefield).
+ANNOTATION_PLAN_PY = r'''#!/usr/bin/env python3
+"""Decide, per genome, which annotator to run and which --proteins to pass.
+
+Runs on the cluster AFTER GTDB-Tk. For every assembly (Autocycler consensus
+or MetaBAT2 bin):
+  * read the GTDB-Tk classification
+  * Bacteria -> bakta,  Archaea -> prokka
+  * resolve the species to a local RefSeq type-strain proteome (offline)
+
+Writes annotation_plan.tsv for the annotation stage to consume, plus
+missing_species.txt listing anything that could not be resolved (feed that to
+build_type_strain_db.py on an internet-connected machine).
+"""
+import argparse, csv, os, re, sys
+from pathlib import Path
+
+
+def pick_type_strain_db(explicit, search_paths):
+    """Choose which type-strain DB to use, at RUNTIME on the cluster.
+
+    An explicitly configured directory wins if it is usable. Otherwise the
+    first candidate that contains a non-empty index.tsv is adopted, so a DB
+    that was built and rsync'd earlier is picked up automatically without
+    anyone having to edit the config.
+
+    Returns (path, how) where how is one of: config, auto, none.
+    """
+    def usable(p):
+        if not p:
+            return None
+        q = Path(os.path.expandvars(os.path.expanduser(str(p))))
+        idx = q / "index.tsv"
+        try:
+            if idx.is_file() and idx.stat().st_size > 0:
+                return str(q)
+        except OSError:
+            pass
+        return None
+
+    if explicit:
+        got = usable(explicit)
+        if got:
+            return got, "config"
+        sys.stderr.write(
+            f"warning: type_strain_db_dir={explicit!r} has no usable "
+            f"index.tsv; falling back to auto-discovery\n")
+
+    for cand in search_paths:
+        got = usable(cand)
+        if got:
+            return got, "auto"
+    return "", "none"
+
+
+def normalize_taxon(name):
+    """Strip GTDB placeholder suffixes (Methanobrevibacter_A -> Methanobrevibacter)."""
+    if not name:
+        return ""
+    name = re.sub(r"^[a-z]__", "", name.strip())
+    parts = [re.sub(r"_[A-Z]+$", "", p) for p in name.split()]
+    return " ".join(p for p in parts if p).strip()
+
+
+def species_key(species):
+    return " ".join(normalize_taxon(species).lower().split())
+
+
+def parse_classification(cls):
+    out = {}
+    for field in (cls or "").split(";"):
+        field = field.strip()
+        for pref, name in (("d__", "domain"), ("p__", "phylum"), ("c__", "class"),
+                           ("o__", "order"), ("f__", "family"), ("g__", "genus"),
+                           ("s__", "species")):
+            if field.startswith(pref):
+                out[name] = field[len(pref):].strip()
+                break
+    return out
+
+
+def load_gtdbtk(gtdbtk_dir):
+    """genome_id -> {domain, genus, species, classification}"""
+    res = {}
+    d = Path(gtdbtk_dir)
+    for f in sorted(d.glob("gtdbtk.*.summary.tsv")):
+        # bac120 -> Bacteria, ar53 -> Archaea (also read from classification)
+        with f.open() as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                gid = (row.get("user_genome") or "").strip()
+                if not gid:
+                    continue
+                cls = row.get("classification", "") or ""
+                t = parse_classification(cls)
+                domain = t.get("domain", "")
+                if not domain:
+                    domain = "Archaea" if "ar53" in f.name else "Bacteria"
+                res[gid] = {
+                    "domain": domain,
+                    "genus": t.get("genus", ""),
+                    "species": t.get("species", ""),
+                    "classification": cls,
+                }
+    return res
+
+
+def load_type_strain_index(db_dir):
+    """species_key -> abs proteome path;  plus genus -> abs proteome path"""
+    by_species, by_genus = {}, {}
+    if not db_dir:
+        return by_species, by_genus
+    d = Path(db_dir)
+    idx = d / "index.tsv"
+    if not idx.exists():
+        sys.stderr.write(f"warning: no index.tsv in {db_dir}\n")
+        return by_species, by_genus
+    with idx.open() as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            rel = (row.get("proteome_rel_path") or "").strip()
+            if not rel:
+                continue
+            p = d / rel
+            if not p.exists() or p.stat().st_size == 0:
+                continue
+            sk = (row.get("species_key") or "").strip().lower()
+            gn = (row.get("genus") or "").strip().lower()
+            if sk:
+                by_species[sk] = str(p)
+            if gn and gn not in by_genus:
+                by_genus[gn] = str(p)
+    return by_species, by_genus
+
+
+def resolve_proteins(species, genus, by_species, by_genus):
+    """Cascade: exact species -> normalised species -> genus -> none."""
+    if species:
+        raw = " ".join(species.lower().split())
+        if raw in by_species:
+            return by_species[raw], "species"
+        norm = species_key(species)
+        if norm and norm in by_species:
+            return by_species[norm], "species-normalised"
+    if genus:
+        g = normalize_taxon(genus).lower()
+        if g in by_genus:
+            return by_genus[g], "genus-fallback"
+    return "", "none"
+
+
+def load_sample_meta(path):
+    """sample -> dict of curated samplesheet metadata."""
+    meta = {}
+    if not path:
+        return meta
+    p = Path(path)
+    if not p.exists():
+        return meta
+    with p.open() as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            s = (row.get("sample") or "").strip()
+            if s:
+                meta[s] = {k: (v or "").strip() for k, v in row.items()}
+    return meta
+
+
+def epithet_of(species):
+    """'Escherichia coli' -> 'coli'.  Bakta/Prokka want genus and epithet
+    as separate flags."""
+    toks = normalize_taxon(species).split()
+    return " ".join(toks[1:]) if len(toks) >= 2 else ""
+
+
+GENBANK_SUFFIXES = {".gb", ".gbk", ".gbf", ".gbff", ".genbank", ".embl", ".dat"}
+
+
+def prepare_proteins(src, tool, workdir):
+    """Return a --proteins path that the chosen annotator will actually accept.
+
+    Bakta's parser (bakta/expert/protein_sequences.py) is:
+
+        cols = record.description.split(' ', 1)[1].split('~~~')
+
+    i.e. it splits the header at the FIRST SPACE and then splits the
+    remainder on '~~~', expecting three fields:
+
+        >SeqID<space>gene~~~product~~~dbxrefs
+
+    Anything else is discarded per-record ('wrong description format in
+    FASTA user protein file'), and a header containing no space at all
+    raises IndexError and aborts the whole run:
+
+        ERROR - EXPERT_AA_SEQ - provided user proteins file Fasta format not valid!
+        IndexError: list index out of range
+
+    A plain RefSeq header ('>WP_000123456.1 chorismate mutase
+    [Escherichia coli]') therefore has to be rewritten. GenBank input is
+    parsed natively by Bakta — and by Prokka — so it passes straight
+    through and is the format to prefer; Prokka also tolerates plain FASTA.
+
+    Converted files are cached in workdir, so this costs one pass the first
+    time and nothing on resume.
+    """
+    if not src:
+        return "", "none"
+    p = Path(src)
+    try:
+        if not p.is_file() or p.stat().st_size == 0:
+            return "", "missing"
+    except OSError:
+        return "", "missing"
+
+    # GenBank/EMBL: both tools read it directly.
+    if p.suffix.lower() in GENBANK_SUFFIXES:
+        return str(p), "genbank"
+    # Prokka copes with plain FASTA (description becomes /product).
+    if tool != "bakta":
+        return str(p), "asis"
+
+    first = ""
+    with p.open(errors="ignore") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                first = line[1:].rstrip("\n")
+                break
+    if not first:
+        return "", "empty"
+    # Already in Bakta's shape? Needs a space, then exactly 3 '~~~' fields.
+    head, sep, rest = first.partition(" ")
+    if sep and len(rest.split("~~~")) == 3:
+        return str(p), "asis"
+
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    out = workdir / (p.stem + ".bakta.faa")
+    if out.is_file() and out.stat().st_size > 0:
+        return str(out), "converted-cached"
+
+    n = 0
+    tmp = out.with_suffix(".tmp")
+    with p.open(errors="ignore") as fin, tmp.open("w") as fo:
+        for line in fin:
+            if line.startswith(">"):
+                hdr = line[1:].strip()
+                sid, _, desc = hdr.partition(" ")
+                # drop a trailing '[Organism name]' and RefSeq's
+                # 'MULTISPECIES: ' prefix, neither of which is a product name
+                desc = re.sub(r"\s*\[[^\]]*\]\s*$", "", desc)
+                desc = re.sub(r"^MULTISPECIES:\s*", "", desc).strip()
+                # '~~~' inside a product would corrupt the field split
+                desc = desc.replace("~~~", " ")
+                if not desc:
+                    desc = "hypothetical protein"
+                # >SeqID<space>gene~~~product~~~dbxrefs   (gene left empty)
+                fo.write(f">{sid} ~~~{desc}~~~RefSeq:{sid}\n")
+                n += 1
+            else:
+                fo.write(line)
+    if n == 0:
+        tmp.unlink(missing_ok=True)
+        return "", "empty"
+    tmp.replace(out)
+    return str(out), f"converted({n})"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gtdbtk-dir", required=True)
+    ap.add_argument("--consensus-dir", required=True)
+    ap.add_argument("--bins-dir", required=True)
+    ap.add_argument("--annotate-dir", required=True)
+    ap.add_argument("--type-strain-db", default="",
+                    help="explicit type-strain DB dir (from pipeline_config.yaml)")
+    ap.add_argument("--type-strain-search", default="",
+                    help="os.pathsep-separated candidate dirs to auto-discover "
+                         "an existing DB when --type-strain-db is unset/unusable")
+    ap.add_argument("--sample-meta", default="",
+                    help="TSV of curated samplesheet metadata for consensuses")
+    ap.add_argument("--out-plan", required=True)
+    ap.add_argument("--out-missing", required=True)
+    args = ap.parse_args()
+
+    search = [p for p in args.type_strain_search.split(os.pathsep) if p.strip()]
+    db_dir, how = pick_type_strain_db(args.type_strain_db, search)
+    if how == "config":
+        print(f"type_strain_db: {db_dir} (from config)")
+    elif how == "auto":
+        print(f"type_strain_db: {db_dir} (auto-discovered existing DB)")
+    else:
+        print("type_strain_db: none found — annotating without --proteins")
+
+    tax = load_gtdbtk(args.gtdbtk_dir)
+    by_species, by_genus = load_type_strain_index(db_dir)
+    meta = load_sample_meta(args.sample_meta)
+    sys.stderr.write(
+        f"type-strain index: {len(by_species)} species, {len(by_genus)} genera\n")
+
+    genomes = []
+    for f in sorted(Path(args.consensus_dir).glob("*.fasta")):
+        genomes.append((f.stem, str(f), "isolate_consensus"))
+    bins_root = Path(args.bins_dir)
+    if bins_root.exists():
+        for f in sorted(bins_root.glob("*/*.fa")):
+            genomes.append((f.stem, str(f), "metagenomic_bin"))
+
+    rows, missing = [], []
+    for gid, path, kind in genomes:
+        t = tax.get(gid, {})
+        domain = t.get("domain", "")
+        gtdb_species = t.get("species", "")
+        gtdb_genus = t.get("genus", "")
+        m = meta.get(gid, {})
+
+        # Archaea -> Prokka, everything else -> Bakta. An unclassified genome
+        # falls through to Bakta, the safer general-purpose default.
+        tool = "prokka" if domain.lower().startswith("archae") else "bakta"
+
+        # Organism metadata: curated samplesheet values win for the isolate
+        # consensuses (they are deliberate); bins have no samplesheet entry so
+        # they take GTDB-Tk's assignment.
+        if kind == "isolate_consensus" and (m.get("genus") or m.get("species")):
+            genus = m.get("genus", "")
+            epithet = m.get("species", "")
+            strain = m.get("strain", "") or gid
+        else:
+            genus = normalize_taxon(gtdb_genus)
+            epithet = epithet_of(gtdb_species)
+            strain = gid
+
+        # --proteins: an explicit samplesheet reference_proteins is a curator
+        # override and wins; otherwise use the RefSeq type strain for whatever
+        # species GTDB-Tk assigned.
+        override = m.get("reference_proteins", "")
+        if override:
+            proteins, src = override, "samplesheet"
+        else:
+            proteins, src = resolve_proteins(
+                gtdb_species, gtdb_genus, by_species, by_genus)
+            if not proteins and (gtdb_species or gtdb_genus):
+                missing.append(gtdb_species or gtdb_genus)
+
+        # Make the file digestible by whichever annotator will read it.
+        if proteins:
+            prepared, how = prepare_proteins(
+                proteins, tool, Path(args.annotate_dir) / "proteins_prepared")
+            if not prepared:
+                sys.stderr.write(
+                    f"{gid}: --proteins {proteins} unusable ({how}), "
+                    f"annotating without it\n")
+                proteins, src = "", f"{src}-unusable"
+            else:
+                if prepared != proteins:
+                    sys.stderr.write(
+                        f"{gid}: reformatted proteins for bakta ({how}): "
+                        f"{prepared}\n")
+                    src = f"{src}+reformatted"
+                proteins = prepared
+
+        rows.append({
+            "genome_id": gid,
+            "input_fasta": path,
+            "assembly_type": kind,
+            "domain": domain or "unknown",
+            "tool": tool,
+            "genus": genus,
+            "species_epithet": epithet,
+            "strain": strain,
+            "gram": m.get("gram", "") if kind == "isolate_consensus" else "",
+            "plasmid": m.get("plasmid", "") if kind == "isolate_consensus" else "",
+            "gtdb_species": normalize_taxon(gtdb_species),
+            "proteins": proteins,
+            "proteins_source": src,
+            "out_dir": str(Path(args.annotate_dir) / gid),
+        })
+
+    fields = ["genome_id", "input_fasta", "assembly_type", "domain", "tool",
+              "genus", "species_epithet", "strain", "gram", "plasmid",
+              "gtdb_species", "proteins", "proteins_source", "out_dir"]
+    # Empty fields are written as a placeholder, NOT as an empty string.
+    # bash's `IFS=$'\t' read` collapses runs of tabs (tab is IFS-whitespace),
+    # so a genuinely empty column in the middle of a row would shift every
+    # later column left and silently corrupt the annotator's arguments.
+    # The consuming loop converts NONE_TOKEN back to "".
+    # lineterminator="\n" is essential: csv defaults to "\r\n", and with
+    # newline="" that CRLF reaches the file verbatim. bash's `read` strips
+    # the \n but NOT the \r, so the last column (out_dir) would carry a
+    # trailing carriage return and annotation would create directories
+    # literally named "<genome_id>\r" that nothing downstream can find.
+    NONE_TOKEN = "__NONE__"
+    with open(args.out_plan, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, delimiter="\t",
+                           lineterminator="\n")
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: (str(r.get(k, "")).strip() or NONE_TOKEN)
+                        for k in fields})
+
+    uniq_missing = sorted(set(m for m in missing if m))
+    with open(args.out_missing, "w") as fh:
+        for m in uniq_missing:
+            fh.write(m + "\n")
+
+    n_bak = sum(1 for r in rows if r["tool"] == "bakta")
+    n_pro = sum(1 for r in rows if r["tool"] == "prokka")
+    n_prot = sum(1 for r in rows if r["proteins"])
+    print(f"planned {len(rows)} genomes: {n_bak} bakta (Bacteria), "
+          f"{n_pro} prokka (Archaea); {n_prot} with --proteins, "
+          f"{len(rows)-n_prot} without")
+    if uniq_missing:
+        print(f"unresolved species ({len(uniq_missing)}): "
+              + ", ".join(uniq_missing[:8])
+              + (" ..." if len(uniq_missing) > 8 else ""))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
 REPORT_PY = r'''#!/usr/bin/env python3
 """Generate publication-ready plots + HTML report from metrics.tsv."""
 import argparse, base64, sys
@@ -2902,19 +3648,45 @@ def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
                 # cap recursion depth — older runs may have MinKNOW-style
                 # nested layout from before s02b's flatten step existed.
                 bam_file=$(find {layout.bams} -type f \\( {bam_name_clauses} \\) 2>/dev/null | head -1)
+
+                # MIJAMP needs the GENOME SEQUENCE, not the annotation, so the
+                # annotator's .fna is a convenience rather than a requirement.
+                # Fall back to the Autocycler consensus (identical sequence)
+                # when annotation is absent, empty or unreadable — a crashed
+                # Bakta run should not also cost us the methylation analysis.
+                # Look for the genome, retrying briefly. On NFS a file written
+                # moments earlier by another node can stay invisible while the
+                # attribute cache is warm, so a single stat is not conclusive.
+                genome=""
+                gsrc=""
+                for _try in 1 2 3; do
+                    if [ -s {fna} ]; then
+                        genome={fna}; gsrc="annotation"; break
+                    fi
+                    if [ -s {layout.consensus}/{s.sample}.fasta ]; then
+                        genome={layout.consensus}/{s.sample}.fasta; gsrc="consensus"
+                        if [ -e {fna} ]; then
+                            log_event WARN "{s.sample}: {fna} exists but is EMPTY (partial/failed annotation) — using the consensus instead"
+                        fi
+                        break
+                    fi
+                    [ "$_try" -lt 3 ] && {{ ls {layout.annotate}/{s.sample}/ >/dev/null 2>&1; sleep 5; }}
+                done
+
                 if [ -z "$bam_file" ]; then
                     log_event WARN "{s.sample}: no demux BAM matching any of: {', '.join(pats)}, skipping"
                     STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
-                elif [ ! -s {fna} ]; then
-                    log_event WARN "{s.sample}: Bakta .fna missing ({fna}), skipping"
+                elif [ -z "$genome" ]; then
+                    log_event WARN "{s.sample}: no usable genome fasta after 3 attempts — neither {fna} nor {layout.consensus}/{s.sample}.fasta is present and non-empty; skipping"
+                    log_event WARN "{s.sample}: dir listing was: $(ls -l {layout.annotate}/{s.sample}/ 2>&1 | tr '\\n' ' ' | cut -c1-300)"
                     STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                 else
-                    log_event OK "{s.sample}: MIJAMP preprocess (bam=$bam_file, genome={fna})"
+                    log_event OK "{s.sample}: MIJAMP preprocess (bam=$bam_file, genome=$genome [$gsrc])"
                     mkdir -p {out_dir}
                     set +e
                     "$MIJAMP_DIR/scripts/preprocess" \\
                         -b "$bam_file" \\
-                        -g {fna} \\
+                        -g "$genome" \\
                         -t {threads} \\
                         -o {out_dir}
                     rc=$?
@@ -3088,10 +3860,16 @@ def main() -> None:
     n13 = stage_map_reads(cfg, layout, samples, hold=n12)
     n14 = stage_meta_assemble(cfg, layout, samples, hold=n13)
     n15 = stage_bin(cfg, layout, samples, hold=n14)
-    n16 = stage_annotate(cfg, layout, samples, hold=n15)
-    n17 = stage_checkm2(cfg, layout, hold=n16)
-    n18 = stage_classify(cfg, layout, samples, hold=n17)
-    n19 = stage_aggregate(cfg, layout, samples, hold=n18)
+    # GTDB-Tk and CheckM2 both take the raw assemblies (consensuses + bins)
+    # and neither needs the other, so they fan out in parallel off s15_bin.
+    n16 = stage_classify(cfg, layout, samples, hold=n15)
+    n17 = stage_checkm2(cfg, layout, hold=n15)
+    # Annotation now genuinely depends on classification: GTDB-Tk's assignment
+    # picks BOTH the annotator (Bacteria->Bakta, Archaea->Prokka) and the
+    # RefSeq type-strain proteome passed to --proteins.
+    n18 = stage_annotate(cfg, layout, samples, hold=n16)
+    # Aggregate reads annotation features + CheckM2 quality + GTDB-Tk taxonomy.
+    n19 = stage_aggregate(cfg, layout, samples, hold=f"{n17},{n18}")
     n20 = stage_report(cfg, layout, hold=n19)
     # MIJAMP needs both the demux BAMs (s02b) and the Bakta .fna (s16, which
     # is upstream of s20). Hold on both so SGE waits for the slower of the two.

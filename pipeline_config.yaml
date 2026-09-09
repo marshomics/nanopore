@@ -9,6 +9,20 @@ mod_models:
   - /ebio/abt3_projects2/Gut_nanopore/data/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_6mA@v1
 kit_name: SQK-RBK114-24
 
+# Barcode classification happens during basecalling (s01) using kit_name, and
+# both demux stages normally just trust the BC tags it wrote (--no-classify).
+#
+# Set demux_reclassify: true to make the demux stages RE-SCAN the already-
+# basecalled reads for barcodes instead. This lets you change the barcode kit
+# without paying for a full re-basecall — signal->sequence conversion doesn't
+# depend on the kit, only the barcode assignment does. CPU-only, minutes not
+# GPU-hours.
+#
+# Remember to delete fastq_raw/, bams/ and everything downstream first, or the
+# resume guards will skip the demux stages entirely.
+demux_reclassify: false
+demux_kit_name: ""        # defaults to kit_name above when left empty
+
 # ---------- CUDA (used during basecall + demux) ----------
 cuda_dir: /ebio/abt3_projects/software
 cuda_version: cuda-11.7
@@ -63,10 +77,37 @@ min_contig_length: 1000
 # (the autocycler default) so older versions without the flag still work.
 max_contigs: 25
 
-# ---------- Bakta ----------
+# ---------- Annotation (Bakta for Bacteria, Prokka for Archaea) ----------
+# Both tools live in conda_env_bakta. GTDB-Tk's domain call selects the tool
+# and its species call selects the --proteins reference.
 bakta_db: /ebio/abt3_scratch/jmarsh/bakta/db/db
 bakta_min_contig_length: 200
 bakta_threads: 20
+
+# Local, offline collection of RefSeq type-strain proteomes used for
+# --proteins. Build it on an INTERNET-CONNECTED machine with:
+#
+#   python3 build_type_strain_db.py \
+#       --from-gtdbtk <run>/gtdbtk/output/gtdbtk.bac120.summary.tsv \
+#       --from-gtdbtk <run>/gtdbtk/output/gtdbtk.ar53.summary.tsv \
+#       --out-dir ./type_strain_db
+#
+# then rsync ./type_strain_db to the cluster and point this at it. The
+# directory must contain index.tsv and proteomes/*.faa.
+#
+# Leave empty to auto-discover (see below). If nothing is found the pipeline
+# annotates without --proteins, logs a WARN, and writes missing_species.txt
+# listing what it wanted.
+type_strain_db_dir: ""
+
+# When type_strain_db_dir is empty — or points somewhere without a usable
+# index.tsv — these locations are searched ON THE CLUSTER at runtime and the
+# first valid one is adopted automatically. <output-dir>/type_strain_db is
+# always tried first, before this list. $VARS and ~ are expanded.
+type_strain_db_search_paths:
+  - /ebio/abt3_scratch/$USER/type_strain_db
+  - /ebio/abt3_projects2/Gut_nanopore/data/type_strain_db
+  - ~/type_strain_db
 
 # ---------- GTDB-Tk ----------
 # Uses Bakta's per-sample *.fna outputs as input. A batchfile of paths is
@@ -84,6 +125,13 @@ flye_meta_min_unmapped_reads: 100   # skip meta-assembly if unmapped read count 
 metabat_min_contig: 1500            # MetaBAT2 default; raise to 2500 for stricter binning
 checkm2_threads: 20
 checkm2_db: /ebio/abt3_scratch/jmarsh/checkm2/db/CheckM2_database/uniref100.KO.1.dmnd
+# CheckM2 uses python multiprocessing, whose shutdown finaliser rmtree's its
+# temp dir. On NFS that hits the "silly rename" problem and throws
+#   OSError: [Errno 16] Device or resource busy: .../pymp-XXXX
+# after the results have already been written — harmless, but noisy, and it
+# leaves stale pymp-* directories behind. Point TMPDIR at node-local disk.
+# Empty means /tmp/checkm2.<pid> on the execution node.
+checkm2_tmpdir: ""
 
 # ---------- MIJAMP ----------
 # Path to a git-cloned MIJAMP repo. Empty value disables the s21_mijamp stage.
@@ -101,4 +149,11 @@ sge_h_rt_assembly: "400:0:0"
 sge_h_vmem_gpu: "80G"
 sge_h_vmem_cpu: "20G"
 sge_h_vmem_gtdbtk: "100G"     # GTDB-Tk database is memory-hungry
+# dorado demux --sort-bam holds records in memory while sorting; a full
+# PromethION run (30M+ reads) will OOM at 20G. Bump if s02b_demux_bam dies
+# silently partway through (SGE hard-kills leave no message in the log).
+sge_h_vmem_demux_bam: "100G"
+# minimap2 index + samtools sort (default ~768M per thread x 20 threads)
+# will not fit in 20G for multi-million-read samples.
+sge_h_vmem_mapping: "100G"
 sge_gpumem: "20G"

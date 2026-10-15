@@ -151,19 +151,32 @@ TSV with these columns (header required, order doesn't matter):
 Put an absolute path in `reference_proteins` and it is passed straight to
 whichever annotator runs for that sample:
 
-- **Amino-acid FASTA (`.faa`) and GenBank (`.gbk`) both work**, for both
-  Bakta and Prokka — the same column covers bacterial and archaeal samples,
-  so you do not need to know in advance which tool will be chosen.
+- **Amino-acid FASTA (`.faa`) and GenBank (`.gbk`, `.gbff`, `.gb`) both
+  work**, for both Bakta and Prokka — the same column covers bacterial and
+  archaeal samples, so you do not need to know in advance which tool will be
+  chosen.
 - **Plain FASTA headers are fine; the pipeline reformats them if needed.**
-  Bakta requires headers shaped `>SeqID~~~gene~~~product~~~dbxref` and
-  silently discards every record that isn't (`skipped incorrectly formatted
-  user proteins: N, imported: 0`, followed by a diamond crash). A normal
-  RefSeq header such as
+  Bakta requires headers shaped `>SeqID gene~~~product~~~dbxrefs` (a space
+  after the ID, then three `~~~`-separated fields) and silently discards
+  every record that isn't (`skipped incorrectly formatted user proteins: N,
+  imported: 0`, followed by a diamond crash). A normal RefSeq header such as
   `>WP_000123456.1 chorismate mutase [Escherichia coli]` therefore has to be
   rewritten. The annotation stage detects this and writes a converted copy to
-  `<output>/bakta/proteins_prepared/`, which is cached and reused. GenBank
-  input passes through untouched, as does anything already in Bakta's format,
-  and Prokka gets the file as-is because it tolerates plain FASTA.
+  `<output>/bakta/proteins_prepared/`, which is cached and reused. Anything
+  already in Bakta's format is used as-is, and Prokka gets the file as-is
+  because it tolerates plain FASTA.
+- **GenBank is converted for Bakta and passed straight to Prokka.** Bakta 1.12
+  reads `--proteins` as FASTA first and exits if that fails, and Biopython
+  ≥ 1.87 fails on any GenBank file, so a GenBank reference handed directly to
+  Bakta dies with `User proteins file Fasta format not valid!` (the stage then
+  re-annotates without `--proteins` and logs a `WARN`). For Bakta the
+  annotation stage therefore extracts the CDS translations into
+  `<output>/bakta/proteins_prepared/<name>.<hash>.bakta.faa`, following the
+  same rules as Bakta's own GenBank reader: `/pseudo` and `/pseudogene` CDSs
+  are skipped, `/locus_tag`, `/product` and `/translation` are required, and
+  `/db_xref` plus `/EC_number` become dbxrefs. The copy is cached per source
+  file (path, size and modification time). Prokka converts GenBank itself.
+  EMBL files are still passed through unchanged.
 - It **overrides** the GTDB-derived RefSeq type-strain proteome. Leave the
   cell blank to let the pipeline pick the type strain automatically.
 - The path is on the **cluster**, and is checked at run time. If the file is
@@ -215,9 +228,24 @@ the stage exits 0 so downstream stages can still run on the samples that
 succeeded. Stage-level crashes (the script itself dying) get an `[ERROR]`
 trap-fired `FAIL` event.
 
-Each stage also greps its SGE stdout log for `error|warn|fail|traceback`
-patterns at the end and emits the first 50 hits as `[SCAN]` events, so
-unusual lines in tool output bubble up to `pipeline.log` automatically.
+At the end, each stage also greps its SGE stdout log for definitive error
+markers (`ERROR:`, `Error:`, `FATAL:`, `FAIL:`, `panic:`, segfaults, `Killed`,
+minus known benign assembler chatter) and emits the first 20 hits as `[SCAN]`
+events, so unusual lines in tool output bubble up to `pipeline.log`
+automatically. SGE appends every run of a stage to the same
+`stdout/<stage>.log`, so only the lines written by the current run are
+scanned; the line number in each `[SCAN]` event refers to the whole file.
+
+`bash <output-dir>/pipeline_status.sh` reports the latest attempt of each
+stage (its events from its last `[START]` onwards): stages started but not
+yet `DONE` (still running, failed, or killed by SGE), stages whose `DONE`
+reports per-sample failures, stage-level `FAIL`s, and per-level event
+counts. Events from earlier attempts stay in `pipeline.log` as history but
+are not reported again once the stage has been re-run. At the end of each
+run `s20_report` writes the same summary to `<output-dir>/pipeline_summary.txt`.
+Logs written by earlier versions of the pipeline contain `pipeline summary`
+blocks (copies of past `START`/`DONE`/`FAIL` events that `s20_report`
+appended to `pipeline.log`); `pipeline_status.sh` ignores them.
 
 ## Resume
 
@@ -295,8 +323,10 @@ to apply a stricter threshold to already-filtered samples, delete the
 ```
 <output-dir>/
 ├── pipeline.log                   # unified event log
+├── pipeline_summary.txt           # s20_report — latest attempt of each stage
 ├── basecalled/basecalls.bam       # s01_basecall
 ├── fastq_raw/                     # s02_demux
+├── bams/                          # s02b_demux_bam — per-barcode BAMs (keep MM/ML tags)
 ├── fastq/<sample>.fastq           # s03_rename
 ├── fastq_filtered/<sample>.fastq  # s04_filter
 ├── autocycler/<sample>/           # s05_subsample, s08_compress, s09_cluster
@@ -304,21 +334,26 @@ to apply a stricter threshold to already-filtered samples, delete the
 ├── autocycler/assemblies_fasta/   # s07_organize (per-sample, length-filtered)
 ├── autocycler/cluster/<sample>/   # s09_cluster (symlink)
 ├── consensus/<sample>.fasta       # s12_collect
-├── bakta/<sample>/                # s13_annotate (Bakta output)
-├── mapping/<sample>/              # s14_map_reads — mapped.bam, flagstat.txt, unmapped.fastq
-├── meta_flye/<sample>/            # s15_meta_assemble — Flye --meta assembly.fasta
-├── bins/<sample>/                 # s16_bin — <sample>_bin.N.fa MetaBAT2 outputs
-├── checkm2/output/                # s17_checkm2 — quality_report.tsv
-├── gtdbtk/
+├── mapping/<sample>/              # s13_map_reads — mapped.bam, flagstat.txt, unmapped.fastq
+├── meta_flye/<sample>/            # s14_meta_assemble — Flye --meta assembly.fasta
+├── bins/<sample>/                 # s15_bin — <sample>_bin.N.fa MetaBAT2 outputs
+├── gtdbtk/                        # s16_classify
 │   ├── batchfile.tsv              # consensuses + bins
 │   └── output/                    # gtdbtk.bac120.summary.tsv, ar53, classify/, etc.
+├── checkm2/output/                # s17_checkm2 — quality_report.tsv
+├── bakta/                         # s18_annotate
+│   ├── <genome_id>/               # Bakta (Bacteria) or Prokka (Archaea) output
+│   ├── annotation_plan.tsv        # annotator and --proteins chosen per genome
+│   └── proteins_prepared/         # --proteins references converted for Bakta (cached)
 ├── reports/
 │   ├── metrics.tsv                # s19_aggregate — long-format per-assembly metrics
 │   ├── plots/*.png                # s20_report — publication-ready figures
 │   └── report.html                # s20_report — final HTML report
+├── mijamp/<sample>/               # s21_mijamp — MIJAMP preprocessing (mapped.bam, data.bed)
 ├── submit_scripts/                # generated SGE scripts
 ├── stdout/                        # SGE per-stage stdout
-└── submit_all.sh
+├── submit_all.sh
+└── pipeline_status.sh             # status of the latest attempt of each stage
 ```
 
 ## Stage order and hold dependencies
@@ -474,6 +509,21 @@ conda_env_mijamp: mijamp
 
 Leaving `mijamp_dir` empty makes `s21_mijamp` log a `WARN` and exit
 cleanly, so the rest of the pipeline still produces all other outputs.
+
+`s21_mijamp` runs MIJAMP's **preprocessing** step only (`scripts/preprocess`:
+minimap2 alignment of each sample's demultiplexed BAM to its genome, then
+modkit), leaving `mijamp/<sample>/genome.fasta`, `mapped.bam`,
+`mapped.bam.bai` and `data.bed` — several GB per sample at typical depths.
+Motif discovery is **not** run by the pipeline; run it per sample when you
+need it:
+
+```bash
+mamba activate mijamp
+<mijamp_dir>/scripts/motif -f <output-dir>/mijamp/<sample>/ -t 20
+```
+
+MIJAMP writes the motif table to `output.tsv` in the same folder.
+
 - Dorado demux output filenames contain the barcode label. The `s03_rename`
   step matches `*<barcode>*.fastq[.gz]`.
 - Autocycler subsample produces 4 subsamples named `sample_01.fastq` …

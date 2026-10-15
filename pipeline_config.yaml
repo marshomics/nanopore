@@ -2,12 +2,12 @@
 # All paths are absolute on the cluster filesystem.
 
 # ---------- Software paths ----------
-dorado_binary: /ebio/abt3_scratch/jmarsh/software/dorado-1.3.1-linux-x64/bin/dorado
+dorado_binary: /ebio/abt3_scratch/jmarsh/software/dorado_212/dorado-2.1.2-linux-x64/bin/dorado
 basecall_model: /ebio/abt3_projects2/Gut_nanopore/data/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0
 mod_models:
   - /ebio/abt3_projects2/Gut_nanopore/data/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_4mC_5mC@v1
   - /ebio/abt3_projects2/Gut_nanopore/data/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_6mA@v1
-kit_name: SQK-RBK114-24
+kit_name: SQK-NBD114-24
 
 # Barcode classification happens during basecalling (s01) using kit_name, and
 # both demux stages normally just trust the BC tags it wrote (--no-classify).
@@ -21,7 +21,7 @@ kit_name: SQK-RBK114-24
 # Remember to delete fastq_raw/, bams/ and everything downstream first, or the
 # resume guards will skip the demux stages entirely.
 demux_reclassify: false
-demux_kit_name: ""        # defaults to kit_name above when left empty
+demux_kit_name: "SQK-NBD114-24"        # defaults to kit_name above when left empty
 
 # ---------- CUDA (used during basecall + demux) ----------
 cuda_dir: /ebio/abt3_projects/software
@@ -137,7 +137,7 @@ checkm2_tmpdir: ""
 # Path to a git-cloned MIJAMP repo. Empty value disables the s21_mijamp stage.
 # Install once with:
 #   git clone https://code.ornl.gov/alexander-public/mijamp.git /path/to/mijamp
-mijamp_dir: ""
+mijamp_dir: "/ebio/abt3_scratch/jmarsh/software/mijamp"
 mijamp_threads: 20
 
 # ---------- SGE ----------

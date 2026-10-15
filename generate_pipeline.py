@@ -300,6 +300,9 @@ def log_setup(name: str, layout: "Layout") -> str:
         PIPELINE_LOG={layout.root}/pipeline.log
         STAGE_LOG={layout.stdout_dir}/{name}.log
         JOB_NAME={name}
+        # SGE appends every run of a stage to the same -o file, so note where
+        # this run starts; log_warn_errors_from scans only the lines after it.
+        STAGE_LOG_START_LINE=$( {{ wc -l < "$STAGE_LOG"; }} 2>/dev/null || echo 0 )
         STAGE_FAIL_COUNT=0
         log_event() {{
             local level="$1"; shift
@@ -323,6 +326,12 @@ def log_setup(name: str, layout: "Layout") -> str:
         log_warn_errors_from() {{
             local f="$1"
             [ -f "$f" ] || return 0
+            # For the stage's own SGE log, skip the lines left by earlier runs
+            # (STAGE_LOG_START_LINE, recorded at stage start); other files are
+            # scanned in full. Reported line numbers stay absolute.
+            local skip=0
+            if [ "$f" = "$STAGE_LOG" ]; then skip="${{STAGE_LOG_START_LINE:-0}}"; fi
+            skip="${{skip//[!0-9]/}}"; skip="${{skip:-0}}"
             # Only match definitive error markers. We drop Traceback because
             # Python-based assemblers (nextDenovo especially) emit tracebacks
             # during normal retry behaviour — real failures still surface as
@@ -336,7 +345,9 @@ def log_setup(name: str, layout: "Layout") -> str:
             #   - plassembler INFO/WARNING noise about canu/unicycler/no plasmids
             #   - our own log events ([SCAN], [WARN], etc.) to prevent
             #     feedback loops when stage stderr is captured into stage log
-            grep -nE '(ERROR:|Error:|FATAL:|Fatal:|FAIL:|panic:|Segmentation fault|core dumped|^Killed$)' "$f" 2>/dev/null \\
+            tail -n +"$((skip + 1))" "$f" 2>/dev/null \\
+                | grep -nE '(ERROR:|Error:|FATAL:|Fatal:|FAIL:|panic:|Segmentation fault|core dumped|^Killed$)' \\
+                | awk -F: -v s="$skip" 'BEGIN {{ OFS = ":" }} {{ $1 = $1 + s; print }}' \\
                 | grep -viE '(error[_ ]?rate|error[_ ]detection|error[_ ]adjustment|error[_ ]threshold|fraction[_ ]error|error[_ ]correction|nextDenovo|cns_align|Re-write workdir|empty job|log\\.critical|\\.tmpfrunt|sgs_fofn|hifi_fofn|Delete task:|plassembler|Unicycler has failed|no plasmids|uncorrected reads|Canu failed to correct|pymp-|_remove_temp_dir|multiprocessing/util|Device or resource busy|\\[(SCAN|WARN|OK|SKIP|START|DONE|FAIL|INFO|SUMMARY)\\])' \\
                 | head -20 \\
                 | sed -E 's/\\x1B\\[[0-9;]*[mGK]//g' \\
@@ -2010,17 +2021,25 @@ def stage_aggregate(cfg: dict, layout: Layout, samples: List[Sample], hold: str)
                 d = load_bakta_json(j)
                 for f in d.get("features", []):
                     t = f.get("type", "")
+                    # Bakta's JSON uses lower-case type names for some features
+                    # ('cds', 'sorf', 'crispr'); they never matched the keys above,
+                    # so every Bakta-annotated genome reported 0 CDS.
+                    t = {{"cds": "CDS", "sorf": "sORF", "crispr": "CRISPR",
+                          "ncRNA-region": "ncRNA"}}.get(t, t)
                     if t in counts:
                         counts[t] += 1
-                    elif t == "ncRNA-region":
-                        counts["ncRNA"] += 1
                 if any(counts.values()):
                     return counts
             # Prokka (or Bakta without JSON): parse the .txt summary.
             t = sample_dir / f"{{stem}}.txt"
             if t.exists():
-                # Prokka keys: CDS, rRNA, tRNA, tmRNA, misc_RNA, repeat_region
-                alias = {{"misc_RNA": "ncRNA", "repeat_region": "CRISPR"}}
+                # Prokka keys: CDS, rRNA, tRNA, tmRNA, misc_RNA, repeat_region;
+                # Bakta's .txt uses plural keys (CDSs, tRNAs, CRISPR arrays, ...)
+                alias = {{"misc_RNA": "ncRNA", "repeat_region": "CRISPR",
+                          "CDSs": "CDS", "tRNAs": "tRNA", "rRNAs": "rRNA",
+                          "tmRNAs": "tmRNA", "ncRNAs": "ncRNA",
+                          "CRISPR arrays": "CRISPR", "sORFs": "sORF",
+                          "oriCs": "oriC", "oriTs": "oriT"}}
                 for line in t.read_text(errors="ignore").splitlines():
                     if ":" not in line:
                         continue
@@ -2335,7 +2354,7 @@ Writes annotation_plan.tsv for the annotation stage to consume, plus
 missing_species.txt listing anything that could not be resolved (feed that to
 build_type_strain_db.py on an internet-connected machine).
 """
-import argparse, csv, os, re, sys
+import argparse, csv, hashlib, os, re, sys
 from pathlib import Path
 
 
@@ -2496,6 +2515,102 @@ def epithet_of(species):
 GENBANK_SUFFIXES = {".gb", ".gbk", ".gbf", ".gbff", ".genbank", ".embl", ".dat"}
 
 
+def genbank_cds_proteins(path):
+    """Yield (locus_tag, gene, product, db_xrefs, translation) per CDS feature.
+
+    Mirrors bakta.expert.protein_sequences.parse_user_protein_sequences_genbank:
+    CDS features carrying /pseudo or /pseudogene are skipped; /locus_tag,
+    /product and /translation are required; /db_xref values plus
+    'EC:<EC_number>' become the dbxrefs.  Plain-text parser, no Biopython.
+    """
+    def unquote(v):
+        v = v.strip()
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            v = v[1:-1]
+        return v.replace('""', '"')
+
+    def finish(feat):
+        if feat is None or feat[0] != "CDS":
+            return None
+        q = feat[1]
+        if "pseudo" in q or "pseudogene" in q:
+            return None
+        def first(k):
+            return unquote(q[k][0]) if q.get(k) else ""
+        locus_tag = first("locus_tag").strip()
+        product = " ".join(first("product").split())
+        seq = re.sub(r"[^A-Za-z*]", "", first("translation")).upper()
+        if not (locus_tag and product and seq):
+            return None
+        gene = first("gene").strip()
+        dbx = [unquote(x).strip() for x in q.get("db_xref", [])]
+        dbx = [x for x in dbx if ":" in x]
+        dbx += ["EC:" + unquote(e).strip() for e in q.get("EC_number", [])]
+        return locus_tag, gene, product, dbx, seq
+
+    feat, cur, in_ft = None, None, False
+    with open(path, errors="ignore") as fh:
+        for raw in fh:
+            line = raw.rstrip("\r\n")
+            if line.startswith("FEATURES"):
+                in_ft = True
+                continue
+            if not in_ft:
+                continue
+            if line[:1] not in ("", " "):
+                # ORIGIN / CONTIG / BASE COUNT / '//' close the feature table
+                rec = finish(feat)
+                if rec:
+                    yield rec
+                feat, cur, in_ft = None, None, False
+                continue
+            if len(line) > 5 and line[:5] == "     " and line[5] != " ":
+                rec = finish(feat)
+                if rec:
+                    yield rec
+                feat, cur = (line[5:21].strip(), {}), None
+                continue
+            if feat is None:
+                continue
+            body = line[21:] if line[:21].strip() == "" else line.strip()
+            if body.startswith("/"):
+                name, _, val = body[1:].partition("=")
+                cur = name.strip()
+                feat[1].setdefault(cur, []).append(val)
+            elif cur is not None:
+                sep = "" if cur == "translation" else " "
+                feat[1][cur][-1] += sep + body.strip()
+    rec = finish(feat)
+    if rec:
+        yield rec
+
+
+def genbank_to_bakta_fasta(p, workdir):
+    """Write Bakta short-format FASTA (>locus_tag gene~~~product~~~dbxrefs)
+    from the CDS translations of a GenBank file; cached per path/size/mtime."""
+    workdir = Path(workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    st = p.stat()
+    key = f"{p.resolve()}:{st.st_size}:{st.st_mtime_ns}"
+    out = workdir / f"{p.stem}.{hashlib.md5(key.encode()).hexdigest()[:10]}.bakta.faa"
+    if out.is_file() and out.stat().st_size > 0:
+        return str(out), "genbank-converted-cached"
+    n = 0
+    tmp = out.with_suffix(".tmp")
+    with tmp.open("w") as fo:
+        for locus_tag, gene, product, dbx, seq in genbank_cds_proteins(p):
+            gene = gene.replace("~~~", " ")
+            product = product.replace("~~~", " ")
+            dbx = ",".join(x.replace(",", ";") for x in dbx)
+            fo.write(f">{locus_tag} {gene}~~~{product}~~~{dbx}\n{seq}\n")
+            n += 1
+    if n == 0:
+        tmp.unlink(missing_ok=True)
+        return "", "empty"
+    tmp.replace(out)
+    return str(out), f"genbank-converted({n})"
+
+
 def prepare_proteins(src, tool, workdir):
     """Return a --proteins path that the chosen annotator will actually accept.
 
@@ -2516,9 +2631,11 @@ def prepare_proteins(src, tool, workdir):
         IndexError: list index out of range
 
     A plain RefSeq header ('>WP_000123456.1 chorismate mutase
-    [Escherichia coli]') therefore has to be rewritten. GenBank input is
-    parsed natively by Bakta — and by Prokka — so it passes straight
-    through and is the format to prefer; Prokka also tolerates plain FASTA.
+    [Escherichia coli]') therefore has to be rewritten. GenBank input passes
+    straight through to Prokka; for Bakta its CDS translations are converted
+    to the short format above (genbank_to_bakta_fasta), because Bakta 1.12
+    with Biopython >= 1.87 rejects GenBank given to --proteins. Prokka also
+    tolerates plain FASTA.
 
     Converted files are cached in workdir, so this costs one pass the first
     time and nothing on resume.
@@ -2532,8 +2649,17 @@ def prepare_proteins(src, tool, workdir):
     except OSError:
         return "", "missing"
 
-    # GenBank/EMBL: both tools read it directly.
+    # GenBank/EMBL: Prokka reads it directly (prokka-genbank_to_fasta_db).
+    # Bakta 1.12 parses --proteins as FASTA *first* and exits if that raises;
+    # Biopython >= 1.87 raises on any non-FASTA text, so a GenBank file dies
+    # with "User proteins file Fasta format not valid!" before Bakta's own
+    # GenBank branch runs.  Convert GenBank CDS translations for Bakta.
     if p.suffix.lower() in GENBANK_SUFFIXES:
+        if tool == "bakta":
+            with p.open(errors="ignore") as fh:
+                head = fh.readline()
+            if head.startswith("LOCUS"):
+                return genbank_to_bakta_fasta(p, workdir)
         return str(p), "genbank"
     # Prokka copes with plain FASTA (description becomes /product).
     if tool != "bakta":
@@ -3591,11 +3717,13 @@ def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
 
         log_warn_errors_from "$STAGE_LOG"
 
-        log_event SUMMARY "pipeline finished — log at $PIPELINE_LOG, report at {layout.reports}/report.html"
-        echo "" >> $PIPELINE_LOG
-        echo "==================== pipeline summary ====================" >> $PIPELINE_LOG
-        grep -aE '\\[(START|DONE|FAIL)\\]' $PIPELINE_LOG | tail -200 >> $PIPELINE_LOG
-        echo "==========================================================" >> $PIPELINE_LOG
+        log_event SUMMARY "pipeline finished — log at $PIPELINE_LOG, summary at {layout.root}/pipeline_summary.txt, report at {layout.reports}/report.html"
+        # Stage summary from pipeline_status.sh (latest attempt of each stage),
+        # rewritten on every report run. It is not appended to pipeline.log: copying
+        # earlier START/DONE/FAIL events back into the log re-reported them (old
+        # FAILs included) on every re-run.
+        PIPELINE_STATUS_SKIP="$JOB_NAME" bash "{layout.root}/pipeline_status.sh" > "{layout.root}/pipeline_summary.txt" 2>&1 || true
+        cat "{layout.root}/pipeline_summary.txt"
         """
     ).strip() + "\n"
     write_script(layout.submit_dir / f"{name}.sh", body)
@@ -3695,7 +3823,7 @@ def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
                         log_event WARN "{s.sample}: MIJAMP rc=$rc"
                         STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                     else
-                        log_event OK "{s.sample}: MIJAMP done"
+                        log_event OK "{s.sample}: MIJAMP preprocessing done (motif discovery is not run by this pipeline)"
                     fi
                 fi
             fi
@@ -3738,9 +3866,13 @@ def write_submit_all(layout: Layout, ordered_jobs: List[List[str]]) -> None:
 
 def write_pipeline_status(layout: Layout) -> None:
     """Standalone helper the user can run anytime to see which stages are
-    in-flight, stalled, or done. Diffs START vs DONE events in pipeline.log
-    and reports orphans (started but never finished — could mean still
-    running OR killed by SGE; SIGKILL bypasses the EXIT trap)."""
+    in-flight, stalled, or done. Considers only the latest attempt of each
+    stage (its events from its last START onwards) so a re-run does not
+    re-report events from earlier attempts, and reports orphans (started
+    but never finished — could mean still running OR killed by SGE;
+    SIGKILL bypasses the EXIT trap). Skips the "pipeline summary" blocks
+    older s20_report versions appended to pipeline.log. s20_report writes
+    its output to pipeline_summary.txt at the end of each run."""
     body = textwrap.dedent(
         f"""
         #!/bin/bash
@@ -3748,39 +3880,66 @@ def write_pipeline_status(layout: Layout) -> None:
         #
         # Usage:  bash {layout.root}/pipeline_status.sh
         #
-        # Reads pipeline.log and reports:
-        #   - stages with [START] but no [DONE]     (running or killed)
-        #   - stages with [DONE] but non-zero failures
-        #   - per-level counts
+        # Reads pipeline.log and reports, for the latest attempt of each stage
+        # (its events from its last [START] onwards):
+        #   - stages with [START] but no [DONE]     (running, failed or killed)
+        #   - stages whose [DONE] reports per-sample failures
+        #   - stage-level [FAIL] events
+        #   - per-level event counts
+        # Earlier attempts of re-run stages stay in pipeline.log as history but are
+        # not reported again.
         LOG="{layout.root}/pipeline.log"
         if [ ! -f "$LOG" ]; then
             echo "No pipeline.log at $LOG"
             exit 1
         fi
 
-        echo "=== event counts ==="
-        grep -aoE '\\[(START|DONE|FAIL|OK|SKIP|WARN|INFO|SCAN|SUMMARY)\\]' "$LOG" \\
+        # Older s20_report versions appended "pipeline summary" blocks (copies of
+        # earlier START/DONE/FAIL events) to pipeline.log; both readers skip them.
+        latest_events() {{
+            awk '
+                FNR == 1 {{ skip = 0 }}
+                /^=+ pipeline summary =+$/ {{ skip = 1; next }}
+                skip {{ if ($0 ~ /^=+$/) skip = 0; next }}
+                NR == FNR {{ if ($2 == "[START]") last[$3] = FNR; next }}
+                !($3 in last) || FNR >= last[$3]
+            ' "$LOG" "$LOG"
+        }}
+        earlier_attempts() {{
+            awk '
+                /^=+ pipeline summary =+$/ {{ skip = 1; next }}
+                skip {{ if ($0 ~ /^=+$/) skip = 0; next }}
+                $2 == "[START]" && $3 != "submit_all" {{ n++; seen[$3] = 1 }}
+                END {{ k = 0; for (s in seen) k++; print n - k }}
+            ' "$LOG"
+        }}
+        EVENTS=$(latest_events)
+
+        echo "=== event counts (latest attempt of each stage) ==="
+        printf '%s\\n' "$EVENTS" | grep -aoE '\\[(START|DONE|FAIL|OK|SKIP|WARN|INFO|SCAN|SUMMARY)\\]' \\
             | sort | uniq -c | sort -rn
 
         echo ""
         echo "=== stages started but not yet DONE ==="
-        comm -23 \\
-            <(grep -aE '\\[START\\]' "$LOG" | awk '{{print $3}}' | sort -u) \\
-            <(grep -aE '\\[DONE\\]'  "$LOG" | awk '{{print $3}}' | sort -u) \\
-            | sed 's/^/  /' || true
-        if [ $? -ne 0 ] || [ -z "$(comm -23 \\
-            <(grep -aE '\\[START\\]' "$LOG" | awk '{{print $3}}' | sort -u) \\
-            <(grep -aE '\\[DONE\\]'  "$LOG" | awk '{{print $3}}' | sort -u))" ]; then
-            echo "  (none)"
-        fi
+        # submit_all logs only [START]; PIPELINE_STATUS_SKIP names further stages to
+        # leave out (s20_report passes itself when it writes pipeline_summary.txt).
+        pending=$(printf '%s\\n' "$EVENTS" | awk -v skip=" submit_all ${{PIPELINE_STATUS_SKIP:-}} " '
+            $2 == "[START]" {{ p[$3] = 1 }}
+            $2 == "[DONE]"  {{ delete p[$3] }}
+            END {{ for (s in p) if (index(skip, " " s " ") == 0) print "  " s }}
+        ' | sort)
+        echo "${{pending:-  (none)}}"
 
         echo ""
         echo "=== stages with per-sample failures ==="
-        grep -aE '\\[DONE\\].*per-sample failures' "$LOG" || echo "  (none)"
+        printf '%s\\n' "$EVENTS" | grep -aE '\\[DONE\\].*per-sample failures' || echo "  (none)"
 
         echo ""
         echo "=== stage-level FAILs ==="
-        grep -aE '\\[FAIL\\]' "$LOG" || echo "  (none)"
+        printf '%s\\n' "$EVENTS" | grep -aE '\\[FAIL\\]' || echo "  (none)"
+
+        echo ""
+        echo "($(earlier_attempts) earlier stage attempts not shown; full history in $LOG)"
         """
     ).strip() + "\n"
     out = layout.root / "pipeline_status.sh"

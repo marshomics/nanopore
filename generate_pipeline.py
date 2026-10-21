@@ -15,7 +15,11 @@ Inputs
 
 Stages (each emits one SGE script unless noted)
 -----------------------------------------------
-  s01_basecall       dorado basecaller (POD5 -> basecalls.bam)
+  s01_basecall       dorado basecaller (POD5 -> basecalls.bam); with
+                     basecall_split_jobs > 1 an SGE array, one GPU job per chunk
+                     of pod5 files (each on its own GPU node)
+  s01b_merge_bam     (basecall_split_jobs > 1) check the chunk BAMs and
+                     concatenate them into basecalls.bam before demux
   s02_demux          dorado demux --emit-fastq (per-barcode FASTQs)
   s03_rename         flatten demux output to fastq/<sample>.fastq
   s04_filter         chopper -q -l on each fastq
@@ -30,10 +34,28 @@ Stages (each emits one SGE script unless noted)
   s10_trim_resolve   autocycler trim + resolve on every cluster_*
   s11_combine        autocycler combine per sample
   s12_collect        gather consensus_assembly.fasta -> consensus/<sample>.fasta
+  s12b_polish        (polish_enabled) dorado polish --bacteria on each consensus,
+                     before mapping and annotation (polish_tools.py; see README)
   s13_annotate       Bakta per sample using samplesheet metadata
   s14_classify       GTDB-Tk classify_wf across all Bakta .fna outputs
   s02b_demux_bam     parallel demux that emits sorted BAMs (retains MM/ML
                      methylation tags from basecalling)
+  s18b_sv            structural heterogeneity within each sample: candidate
+                     SVs (known genome versions and/or Sniffles2) re-genotyped
+                     against explicit alleles with spanning reads or, for
+                     events longer than the reads, at their breakpoint
+                     junctions (sv_genotype.py; see README)
+  s18c_snv           (snv_enabled) SNPs and indels between samples and against
+                     reference genomes: reads of each sample mapped to its own
+                     consensus, to near-identical samples and to snv_references,
+                     validated caller configuration (snv_tools.py; see README)
+  s18d_minor         (minor_enabled) minority SNVs within each sample against the
+                     sample's own error model, with linkage into haplotype groups
+                     (minor_variants.py; see README)
+  s18e_phava         (phava_enabled) phase variation: invertible DNA segments
+                     between inverted repeats, found and quantified with PhaVa on
+                     each consensus and its reads, with gene context
+                     (phava_tools.py; see README)
   s21_mijamp         MIJAMP preprocess per sample on the demux BAM + Bakta .fna
 
 Logging + resume
@@ -55,7 +77,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
+import shutil
 import stat
 import sys
 import textwrap
@@ -238,11 +262,14 @@ def sge_header(
     gpu: bool = False,
     gpumem: str = "20G",
     hold_jid: str | None = None,
+    array_tasks: int | None = None,
 ) -> str:
+    # An array job writes one log per task; SGE substitutes $TASK_ID in -o.
+    log_name = f"{job_name}.$TASK_ID" if array_tasks else job_name
     lines = [
         "#!/bin/bash",
         f"#$ -N {job_name}",
-        f"#$ -o {stdout_dir}/{job_name}.log",
+        f"#$ -o {stdout_dir}/{log_name}.log",
         "#$ -j y",
         "#$ -cwd",
         f"#$ -l h_rt={h_rt}",
@@ -251,6 +278,8 @@ def sge_header(
         "#$ -m a",
         f"#$ -M {email}",
     ]
+    if array_tasks:
+        lines.append(f"#$ -t 1-{array_tasks}")
     if gpu:
         lines += [f"#$ -l gpumem={gpumem}", "#$ -l gpu=1"]
     if hold_jid:
@@ -424,6 +453,7 @@ class Layout:
     gtdbtk: Path
     reports: Path
     mijamp: Path
+    sv: Path
     submit_dir: Path
     stdout_dir: Path
 
@@ -451,6 +481,7 @@ class Layout:
             gtdbtk=root / "gtdbtk",
             reports=root / "reports",
             mijamp=root / "mijamp",
+            sv=root / "sv",
             submit_dir=root / "submit_scripts",
             stdout_dir=root / "stdout",
         )
@@ -502,6 +533,415 @@ def stage_basecall(cfg: dict, layout: Layout) -> str:
                 exit $rc
             fi
             log_event OK "basecalls.bam written"
+        fi
+
+        log_warn_errors_from "$STAGE_LOG"
+        """
+    ).strip() + "\n"
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s01 basecall split across GPU nodes + s01b merge ---------------------
+#
+# dorado cannot spread one job across nodes, so with basecall_split_jobs > 1 the
+# pod5 files are divided into that many chunks at generate time and s01_basecall
+# becomes an SGE array: task i basecalls chunk i on its own GPU node (the gpu
+# complex is 1 per host here) into basecalled/chunks/chunk_<i>.bam. s01b_merge_bam
+# then checks every chunk and concatenates them into basecalled/basecalls.bam, so
+# s02_demux, s02b_demux_bam and everything after them are unchanged.
+
+# Slowest card class measured on this cluster for sup v5.2 + 4mC_5mC + 6mA: 2.89-2.93
+# GB of pod5 per hour on 4x TITAN Xp nodes (basecall_split_validation/), rounded down.
+# Used only to warn when a chunk might not finish inside basecall_split_h_rt.
+BASECALL_SLOWEST_GB_PER_HOUR = 2.8
+
+
+def basecall_split_jobs(cfg: dict) -> int:
+    """Number of GPU jobs s01_basecall is split into (1 = one job, the default)."""
+    v = cfg.get("basecall_split_jobs", 1)
+    if isinstance(v, bool) or not str(v).strip().isdigit() or int(v) < 1:
+        raise SystemExit(f"basecall_split_jobs must be a whole number >= 1, got {v!r}")
+    return int(v)
+
+
+def _balance(files: List[tuple], n_jobs: int) -> List[List[tuple]]:
+    """Largest file first, each onto the chunk with the fewest bytes so far (ties:
+    lowest chunk number), so chunk sizes differ by at most one file."""
+    n = min(n_jobs, len(files))
+    chunks: List[List[tuple]] = [[] for _ in range(n)]
+    load = [0] * n
+    for name, size in sorted(files, key=lambda f: (-f[1], f[0])):
+        i = min(range(n), key=lambda k: (load[k], k))
+        chunks[i].append((name, size))
+        load[i] += size
+    for ch in chunks:
+        ch.sort()
+    return chunks
+
+
+def _chunk_width(n: int) -> int:
+    return max(2, len(str(n)))
+
+
+def plan_basecall_chunks(pod5_dir: Path, n_jobs: int, previous: Path) -> tuple:
+    """Assign the pod5 files dorado would read to chunks; returns (chunks, n_kept).
+
+    dorado reads the *.pod5 files directly inside the folder (no --recursive), so
+    those are the files assigned, to at most n_jobs balanced chunks. The plan is
+    written to submit_scripts/s01_basecall_chunks.tsv, and s01b_merge_bam refuses
+    to merge if the folder no longer matches it.
+
+    Re-generating into the same output folder (for example after the sequencing run
+    wrote more pod5 files) keeps the previous plan's chunks unchanged when all their
+    files are still there at the same size, so finished chunks are not basecalled
+    again; only the files the plan lacks are assigned, to up to n_jobs new chunks
+    after the old ones. Delete the plan file to plan from scratch.
+    """
+    files = {p.name: p.stat().st_size for p in pod5_dir.iterdir()
+             if p.name.endswith(".pod5") and p.is_file()}
+    if not files:
+        raise SystemExit("basecall_split_jobs > 1 plans the chunks from the pod5 files, "
+                         f"but there are none directly inside {pod5_dir}")
+    old: dict = {}
+    if previous.is_file():
+        with previous.open() as fh:
+            next(fh, None)
+            for line in fh:
+                ch, name, size = line.rstrip("\n").split("\t")
+                old.setdefault(ch, []).append((name, int(size)))
+    if old:
+        ids = sorted(old)
+        planned = {name for ch in old.values() for name, _ in ch}
+        new = sorted((name, size) for name, size in files.items() if name not in planned)
+        extra = _balance(new, n_jobs) if new else []
+        total = len(ids) + len(extra)
+        if (ids == [f"{i:0{len(ids[0])}d}" for i in range(1, len(ids) + 1)]
+                and len(ids[0]) == _chunk_width(total)
+                and all(files.get(name) == size for ch in old.values() for name, size in ch)):
+            return [sorted(old[i]) for i in ids] + extra, len(ids)
+        print(f"{previous.name}: the previous chunk plan no longer matches {pod5_dir}; "
+              "planning afresh, so finished chunks will be basecalled again")
+    return _balance(sorted(files.items()), n_jobs), 0
+
+
+def basecall_settings_key(cfg: dict) -> str:
+    """Digest of the settings that change what dorado writes for a chunk; a chunk
+    finished under other settings is basecalled again."""
+    parts = (cfg["dorado_binary"], cfg["basecall_model"], ",".join(cfg["mod_models"]), cfg["kit_name"])
+    return hashlib.sha256("\n".join(str(p) for p in parts).encode()).hexdigest()[:16]
+
+
+def _h_rt_hours(h_rt: str):
+    try:
+        if ":" in h_rt:
+            h, m, sec = (h_rt.split(":") + ["0", "0"])[:3]
+            return int(h) + int(m) / 60 + int(sec) / 3600
+        return int(h_rt) / 3600
+    except ValueError:
+        return None
+
+
+def report_basecall_plan(cfg: dict, chunks: List[List[tuple]], requested: int, n_kept: int) -> None:
+    sizes = [sum(size for _, size in ch) for ch in chunks]
+    n_files = sum(len(ch) for ch in chunks)
+    print(f"s01_basecall: {len(chunks)} GPU jobs over {n_files} pod5 files "
+          f"({sum(sizes) / 1e9:.1f} GB); chunks of {min(sizes) / 1e9:.1f}-{max(sizes) / 1e9:.1f} GB")
+    if n_kept == len(chunks):
+        print("  same chunk plan as before (no pod5 files added)")
+    elif n_kept:
+        print(f"  kept chunks 1-{n_kept} of the previous plan; {len(chunks) - n_kept} new chunk(s) "
+              "for pod5 files added since")
+    elif len(chunks) < requested:
+        print(f"  basecall_split_jobs is {requested}, but there are only {n_files} pod5 files")
+    h_rt = str(cfg.get("basecall_split_h_rt") or cfg["sge_h_rt_gpu"])
+    hours = _h_rt_hours(h_rt)
+    worst = max(sizes) / 1e9 / BASECALL_SLOWEST_GB_PER_HOUR
+    if hours is not None and worst > hours:
+        print(f"WARNING: the largest chunk ({max(sizes) / 1e9:.1f} GB) can take {worst:.1f} h on the "
+              f"slowest GPU class measured here ({BASECALL_SLOWEST_GB_PER_HOUR:g} GB/h), more than "
+              f"basecall_split_h_rt ({h_rt}). Raise basecall_split_jobs or basecall_split_h_rt.",
+              file=sys.stderr)
+
+
+def stage_basecall_split(cfg: dict, layout: Layout, chunks: List[List[tuple]]) -> str:
+    name = "s01_basecall"
+    n = len(chunks)
+    width = _chunk_width(n)
+    manifest = layout.submit_dir / "s01_basecall_chunks.tsv"
+    with manifest.open("w") as fh:
+        fh.write("chunk\tpod5_file\tbytes\n")
+        for i, ch in enumerate(chunks, 1):
+            for fname, size in ch:
+                fh.write(f"{i:0{width}d}\t{fname}\t{size}\n")
+    mod_models = ",".join(cfg["mod_models"])
+    chunk_dir = layout.basecalled / "chunks"
+    body = sge_header(
+        name, layout.stdout_dir,
+        str(cfg.get("basecall_split_h_rt") or cfg["sge_h_rt_gpu"]),
+        str(cfg.get("basecall_split_h_vmem") or cfg["sge_h_vmem_gpu"]),
+        int(cfg.get("basecall_split_slots") or cfg["sge_pe_parallel"]),
+        cfg["email"], gpu=True,
+        gpumem=str(cfg.get("basecall_split_gpumem") or cfg["sge_gpumem"]),
+        array_tasks=n,
+    )
+    body += conda_block(cfg["conda_env_basecall"]) + "\n"
+    body += cuda_block(cfg) + "\n\n"
+    # Each task logs under its own stage name (s01_basecall.<task>), so
+    # pipeline_status.sh lists the chunks that are still running.
+    body += log_setup(name + ".${SGE_TASK_ID}", layout) + "\n\n"
+    body += textwrap.dedent(
+        f"""
+        TASK="${{SGE_TASK_ID:-}}"
+        case "$TASK" in
+            ''|*[!0-9]*)
+                log_event WARN "s01_basecall.sh is an SGE array job; submit it with qsub (SGE_TASK_ID='$TASK')"
+                exit 1 ;;
+        esac
+        CH=$(printf '%0{width}d' "$TASK")
+        MANIFEST={manifest}
+        CHUNK_DIR={chunk_dir}
+        CHUNK_BAM="$CHUNK_DIR/chunk_$CH.bam"
+        CHUNK_DONE="$CHUNK_DIR/chunk_$CH.done"
+        LINKS="$CHUNK_DIR/pod5_$CH"
+        # A finished chunk counts only for the same files and basecalling settings.
+        SETTINGS_KEY={basecall_settings_key(cfg)}
+        CH_LINES=$(awk -F'\\t' -v c="$CH" 'NR > 1 && $1 == c' "$MANIFEST")
+        CHUNK_KEY=$(printf '%s\\n%s\\n' "$CH_LINES" "$SETTINGS_KEY" | sha256sum | cut -c1-64)
+        mkdir -p "$CHUNK_DIR"
+
+        if [ -z "$CH_LINES" ]; then
+            log_event WARN "chunk $CH has no pod5 files in $MANIFEST"
+            exit 1
+        elif [ -s {layout.bam_path} ]; then
+            log_event SKIP "basecalls.bam already exists ($(stat -c %s {layout.bam_path}) bytes); chunk $CH not needed"
+        elif [ -s "$CHUNK_BAM" ] && [ -s "$CHUNK_DONE" ] && grep -qx "chunk_key=$CHUNK_KEY" "$CHUNK_DONE"; then
+            log_event SKIP "chunk $CH already basecalled ($(stat -c %s "$CHUNK_BAM") bytes)"
+        else
+            rm -f "$CHUNK_DONE" "$CHUNK_BAM" "$CHUNK_BAM.partial"
+            rm -rf "$LINKS"
+            mkdir -p "$LINKS"
+            n_files=0; n_bytes=0; n_bad=0
+            while IFS=$'\\t' read -r c f sz; do
+                src="{layout.pod5_dir}/$f"
+                if [ ! -f "$src" ]; then
+                    log_event WARN "chunk $CH: $f is no longer in {layout.pod5_dir}"
+                    n_bad=$((n_bad+1)); continue
+                fi
+                now=$(stat -L -c %s "$src")
+                if [ "$now" != "$sz" ]; then
+                    log_event WARN "chunk $CH: $f is $now bytes but was $sz when the pipeline was generated"
+                    n_bad=$((n_bad+1)); continue
+                fi
+                ln -s "$src" "$LINKS/$f"
+                n_files=$((n_files+1)); n_bytes=$((n_bytes+sz))
+            done <<< "$CH_LINES"
+            if [ "$n_bad" -gt 0 ]; then
+                log_event WARN "chunk $CH not basecalled: $n_bad pod5 file(s) missing or changed; re-run generate_pipeline.py, then submit_all.sh"
+                rm -rf "$LINKS"
+                exit 1
+            fi
+            gpus=""
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                gpus=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | paste -sd ';' -)
+            fi
+            log_event OK "chunk $CH: dorado basecaller on $n_files pod5 files ($n_bytes bytes) on $(hostname), GPUs: ${{gpus:-not reported}}"
+            t0=$(date +%s)
+            {cfg['dorado_binary']} basecaller \\
+                {cfg['basecall_model']} \\
+                "$LINKS" \\
+                --modified-bases-models {mod_models} \\
+                --kit-name {cfg['kit_name']} \\
+                > "$CHUNK_BAM.partial"
+            rc=$?
+            t1=$(date +%s)
+            if [ $rc -ne 0 ] || [ ! -s "$CHUNK_BAM.partial" ]; then
+                log_event WARN "dorado basecaller exited with code $rc on chunk $CH"
+                rm -f "$CHUNK_BAM.partial"
+                rm -rf "$LINKS"
+                exit $(( rc == 0 ? 1 : rc ))
+            fi
+            mv -f "$CHUNK_BAM.partial" "$CHUNK_BAM"
+            {{
+                echo "chunk=$CH"
+                echo "chunk_key=$CHUNK_KEY"
+                echo "pod5_files=$n_files"
+                echo "pod5_bytes=$n_bytes"
+                echo "bam_bytes=$(stat -c %s "$CHUNK_BAM")"
+                echo "host=$(hostname)"
+                echo "gpus=$gpus"
+                echo "start_epoch=$t0"
+                echo "seconds=$((t1 - t0))"
+            }} > "$CHUNK_DONE.tmp" && mv -f "$CHUNK_DONE.tmp" "$CHUNK_DONE"
+            rm -rf "$LINKS"
+            log_event OK "chunk $CH basecalled in $((t1 - t0)) s ($(stat -c %s "$CHUNK_BAM") bytes)"
+        fi
+
+        log_warn_errors_from "$STAGE_LOG"
+        """
+    ).strip() + "\n"
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+def stage_merge_basecalls(cfg: dict, layout: Layout, chunks: List[List[tuple]], hold: str) -> str:
+    name = "s01b_merge_bam"
+    n = len(chunks)
+    width = _chunk_width(n)
+    threads = 4
+    manifest = layout.submit_dir / "s01_basecall_chunks.tsv"
+    chunk_dir = layout.basecalled / "chunks"
+    keep = 1 if cfg.get("basecall_split_keep_chunks", False) else 0
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"],
+        cfg.get("sge_h_vmem_merge_bam", "4G"), threads, cfg["email"], hold_jid=hold,
+    )
+    # Activating the nanopore env runs `R CMD javareconf`, and R's threaded OpenBLAS reserves
+    # address space for every core of the node: under this stage's small h_vmem on a 128-core
+    # node the activation then spins instead of finishing (>300 s, against 2 s with one thread).
+    body += "export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1\n"
+    body += conda_block(cfg["conda_env_demux"]) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    body += textwrap.dedent(
+        f"""
+        if ! check_samtools "{cfg['conda_env_demux']}"; then
+            log_event WARN "aborting s01b - samtools >= 1.10 is required to merge the chunk BAMs"
+            exit 1
+        fi
+        # quickcheck -u: dorado's BAMs are unaligned, and without -u quickcheck rejects
+        # any BAM whose header lists no reference sequences.
+        MANIFEST={manifest}
+        CHUNK_DIR={chunk_dir}
+        OUT={layout.bam_path}
+        N={n}
+        SETTINGS_KEY={basecall_settings_key(cfg)}
+        KEEP_CHUNKS={keep}
+        mkdir -p "$CHUNK_DIR"
+
+        if [ -s "$OUT" ]; then
+            log_event SKIP "basecalls.bam already exists ($(stat -c %s "$OUT") bytes)"
+        else
+            n_bad=0
+            # 1. The pod5 folder still holds exactly the files the chunks were planned from.
+            find -L {layout.pod5_dir} -maxdepth 1 -name '*.pod5' -type f -printf '%f\\n' | LC_ALL=C sort > "$CHUNK_DIR/pod5_now.txt"
+            awk -F'\\t' 'NR > 1 {{ print $2 }}' "$MANIFEST" | LC_ALL=C sort > "$CHUNK_DIR/pod5_planned.txt"
+            n_new=$(LC_ALL=C comm -23 "$CHUNK_DIR/pod5_now.txt" "$CHUNK_DIR/pod5_planned.txt" | wc -l)
+            n_gone=$(LC_ALL=C comm -13 "$CHUNK_DIR/pod5_now.txt" "$CHUNK_DIR/pod5_planned.txt" | wc -l)
+            if [ "$n_new" -gt 0 ]; then
+                first_new=$(LC_ALL=C comm -23 "$CHUNK_DIR/pod5_now.txt" "$CHUNK_DIR/pod5_planned.txt" | head -1)
+                running=""
+                ls {layout.pod5_dir}/../final_summary_*.txt >/dev/null 2>&1 || running=" (no final_summary_*.txt next to the pod5 folder: the sequencing run may still be writing files)"
+                log_event WARN "$n_new pod5 file(s) in {layout.pod5_dir} are not in the chunk plan, e.g. $first_new$running; their reads would be missing. Re-run generate_pipeline.py with the same arguments (it keeps the finished chunks and adds chunks for the new files), then submit_all.sh"
+                n_bad=$((n_bad+1))
+            fi
+            if [ "$n_gone" -gt 0 ]; then
+                log_event WARN "$n_gone pod5 file(s) of the chunk plan are no longer in {layout.pod5_dir}"
+                n_bad=$((n_bad+1))
+            fi
+
+            # 2. Every chunk finished with the current plan and settings, and its BAM is intact.
+            printf 'chunk\\tpod5_files\\tpod5_bytes\\treads\\tbam_bytes\\thost\\tgpus\\tseconds\\tgb_per_hour\\n' > "$CHUNK_DIR/summary.tsv.tmp"
+            done_field() {{ awk -v k="$1" 'index($0, k "=") == 1 {{ print substr($0, length(k) + 2); exit }}' "$2"; }}
+            total=0
+            inputs=()
+            for i in $(seq 1 "$N"); do
+                CH=$(printf '%0{width}d' "$i")
+                bam="$CHUNK_DIR/chunk_$CH.bam"
+                done_f="$CHUNK_DIR/chunk_$CH.done"
+                ch_lines=$(awk -F'\\t' -v c="$CH" 'NR > 1 && $1 == c' "$MANIFEST")
+                key=$(printf '%s\\n%s\\n' "$ch_lines" "$SETTINGS_KEY" | sha256sum | cut -c1-64)
+                if [ ! -s "$bam" ] || [ ! -s "$done_f" ]; then
+                    log_event WARN "chunk $CH is not finished (see {layout.stdout_dir}/s01_basecall.$i.log)"
+                    n_bad=$((n_bad+1)); continue
+                fi
+                if ! grep -qx "chunk_key=$key" "$done_f"; then
+                    log_event WARN "chunk $CH was basecalled for another chunk plan or other basecalling settings; re-run submit_all.sh to redo it"
+                    rm -f "$done_f"
+                    n_bad=$((n_bad+1)); continue
+                fi
+                if ! samtools quickcheck -u "$bam"; then
+                    log_event WARN "chunk $CH BAM is truncated or corrupt; moved to chunk_$CH.bam.bad, re-run submit_all.sh to basecall it again"
+                    mv -f "$bam" "$bam.bad"
+                    rm -f "$done_f"
+                    n_bad=$((n_bad+1)); continue
+                fi
+                reads=$(samtools view -c -@ {threads} "$bam")
+                if ! [ "$reads" -ge 0 ] 2>/dev/null; then
+                    log_event WARN "could not count the reads of chunk $CH"
+                    n_bad=$((n_bad+1)); continue
+                fi
+                # Empty fields become NA: tab is whitespace to `read`, so an empty
+                # field would shift the ones after it when the summary is read back.
+                secs=$(done_field seconds "$done_f"); secs=${{secs:-NA}}
+                pbytes=$(done_field pod5_bytes "$done_f"); pbytes=${{pbytes:-NA}}
+                nfiles=$(done_field pod5_files "$done_f"); nfiles=${{nfiles:-NA}}
+                host=$(done_field host "$done_f"); host=${{host:-NA}}
+                gpus=$(done_field gpus "$done_f"); gpus=${{gpus:-NA}}
+                gbh=$(awk -v b="$pbytes" -v s="$secs" 'BEGIN {{ if (s + 0 > 0 && b + 0 > 0) printf "%.2f", b / 1e9 / (s / 3600); else print "NA" }}')
+                printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$CH" "$nfiles" "$pbytes" "$reads" \\
+                    "$(stat -c %s "$bam")" "$host" "$gpus" "$secs" "$gbh" >> "$CHUNK_DIR/summary.tsv.tmp"
+                total=$((total + reads))
+                inputs+=("$bam")
+            done
+            if [ "$n_bad" -gt 0 ]; then
+                log_event WARN "basecalls.bam not written: $n_bad problem(s) above"
+                exit 1
+            fi
+
+            # 3. Header: @HD and @PG of chunk 1, the read groups of every chunk (an id must
+            #    carry the same line in all of them), and @CO lines recording the split.
+            HDR="$CHUNK_DIR/merged_header.sam"
+            samtools view -H "${{inputs[0]}}" | awk '/^@HD/' > "$HDR.tmp"
+            for b in "${{inputs[@]}}"; do samtools view -H "$b"; done | awk -F'\\t' '
+                /^@RG/ {{
+                    id = ""
+                    for (k = 2; k <= NF; k++) if ($k ~ /^ID:/) id = $k
+                    if (id in seen) {{ if (seen[id] != $0) bad = 1; next }}
+                    seen[id] = $0
+                    print
+                }}
+                END {{ exit bad }}' >> "$HDR.tmp"
+            rg_rc=$?
+            if [ "$rg_rc" -ne 0 ]; then
+                log_event WARN "chunks disagree on the header line of a read group; basecalls.bam not written"
+                rm -f "$HDR.tmp"
+                exit 1
+            fi
+            samtools view -H "${{inputs[0]}}" | awk '/^@PG/' >> "$HDR.tmp"
+            printf '@CO\\ts01_basecall ran as %s GPU jobs over the pod5 files in %s (chunk plan %s); the basecaller @PG line is that of chunk 1, every chunk ran the same command on links to its own pod5 files\\n' \\
+                "$N" "{layout.pod5_dir}" "$MANIFEST" >> "$HDR.tmp"
+            tail -n +2 "$CHUNK_DIR/summary.tsv.tmp" | while IFS=$'\\t' read -r ch nf pb rd bb host gpus secs gbh; do
+                printf '@CO\\ts01_basecall chunk %s: %s pod5 files, %s bytes, %s reads, basecalled in %s s on %s (%s)\\n' \\
+                    "$ch" "$nf" "$pb" "$rd" "$secs" "$host" "$gpus"
+            done >> "$HDR.tmp"
+            mv -f "$HDR.tmp" "$HDR"
+
+            # 4. Concatenate in chunk order and check the result before it is put in place.
+            log_event OK "concatenating $N chunk BAMs ($total reads)"
+            samtools cat -h "$HDR" -o "$OUT.partial" "${{inputs[@]}}"
+            rc=$?
+            if [ "$rc" -ne 0 ] || ! samtools quickcheck -u "$OUT.partial"; then
+                log_event WARN "samtools cat failed (rc=$rc); basecalls.bam not written"
+                rm -f "$OUT.partial"
+                exit 1
+            fi
+            n_out=$(samtools view -c -@ {threads} "$OUT.partial")
+            if [ "$n_out" != "$total" ]; then
+                log_event WARN "the merged BAM has $n_out records but the chunks have $total; basecalls.bam not written"
+                rm -f "$OUT.partial"
+                exit 1
+            fi
+            mv -f "$OUT.partial" "$OUT"
+            mv -f "$CHUNK_DIR/summary.tsv.tmp" "$CHUNK_DIR/summary.tsv"
+            log_event OK "basecalls.bam written: $total reads from $N chunks ($(stat -c %s "$OUT") bytes); per-chunk times in $CHUNK_DIR/summary.tsv"
+            if [ "$KEEP_CHUNKS" = 1 ]; then
+                log_event OK "kept the chunk BAMs in $CHUNK_DIR (basecall_split_keep_chunks: true)"
+            else
+                # The chunk BAMs duplicate basecalls.bam. Their .done records stay, and
+                # the tasks skip on a re-run because basecalls.bam exists.
+                rm -f "${{inputs[@]}}"
+                log_event OK "removed the $N chunk BAMs (basecall_split_keep_chunks: false)"
+            fi
         fi
 
         log_warn_errors_from "$STAGE_LOG"
@@ -1259,6 +1699,212 @@ def stage_collect(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -
     return name
 
 
+# ---- s12b consensus polishing --------------------------------------------
+
+# Defaults chosen by the validation rules (README "Small variants: validation").
+POLISH_DEFAULT_DEPTH = 100
+SNV_DEFAULT_CALLER = "INT"
+SNV_DEFAULT_DEPTH = 25
+
+POLISH_ENGINE = Path(__file__).resolve().parent / "polish_tools.py"
+
+
+def stage_polish(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str | None:
+    """Polish each Autocycler consensus with `dorado polish --bacteria` (s12b).
+
+    Written only with polish_enabled: true; otherwise there is no s12b script and
+    s13 holds on s12_collect as before. Reads: a deterministic read-name-hash
+    subsample of fastq_filtered/<sample>.fastq at polish_depth-fold coverage,
+    mapped with minimap2 -x lr:hq keeping each read's RG tag (dorado picks its
+    polishing model from the basecall model in the @RG header). The change table
+    comes from dorado's VCF and must turn the draft into dorado's consensus
+    exactly; only then is consensus/<sample>.fasta replaced (same contig names
+    and FASTA headers, length= updated). A consensus that downstream stages have
+    already used (s13 mapping or annotation present) is never replaced unless
+    polish_replace_existing is true. With polish_install: false (review mode)
+    the polished genome and change table are written but the consensus is left
+    unchanged.
+    Outputs: polish/<sample>/{draft.fasta, polished.fasta, changes.tsv,
+    variants.vcf, info.json, logs}.
+    """
+    if not bool(cfg.get("polish_enabled", False)):
+        return None
+    name = "s12b_polish"
+    threads = int(cfg.get("polish_threads", 16))
+    env = cfg.get("conda_env_snv", "snv")
+    depth = int(cfg.get("polish_depth", POLISH_DEFAULT_DEPTH))
+    device = str(cfg.get("polish_device", "cpu"))
+    replace = bool(cfg.get("polish_replace_existing", False))
+    install = bool(cfg.get("polish_install", True))
+    max_change = float(cfg.get("polish_max_length_change", 0.001))
+    model_name = Path(str(cfg["basecall_model"])).name
+    models_dir = str(cfg.get("polish_models_dir") or Path(str(cfg["basecall_model"])).parent)
+    gpu = device.startswith("cuda")
+    problems = []
+    if not POLISH_ENGINE.is_file():
+        problems.append(f"{POLISH_ENGINE} is missing (it ships next to generate_pipeline.py)")
+    if not 10 <= depth <= 1000:
+        problems.append("polish_depth must be between 10 and 1000")
+    if device != "cpu" and not gpu:
+        problems.append(f"polish_device must be cpu or cuda:... (got {device!r})")
+    if not 0 < max_change < 0.1:
+        problems.append("polish_max_length_change must be in (0, 0.1)")
+    if threads < 1:
+        problems.append("polish_threads must be >= 1")
+    if problems:
+        raise SystemExit("pipeline_config.yaml (s12b_polish): " + "; ".join(problems))
+    engine = layout.submit_dir / "_polish_tools.py"
+    shutil.copyfile(POLISH_ENGINE, engine)
+    engine.chmod(engine.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_gpu"] if gpu else cfg["sge_h_rt_cpu"],
+        cfg.get("sge_h_vmem_polish", "6G"), threads, cfg["email"],
+        gpu=gpu, gpumem=cfg.get("sge_gpumem", "20G"), hold_jid=hold,
+    )
+    body += conda_block(env) + "\n\n"
+    if gpu:
+        body += cuda_block(cfg) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    pol = layout.root / "polish"
+    body += textwrap.dedent(
+        f"""
+        export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+        set +e
+        set -o pipefail
+        POLISH_DIR={pol}
+        PT={engine}
+        DORADO={cfg['dorado_binary']}
+        MODELS={models_dir}
+        mkdir -p "$POLISH_DIR"
+        if ! python3 -c "import mappy, pysam" 2>/dev/null; then
+            log_event WARN "the '{env}' conda env lacks mappy/pysam (needs python>=3.9, mappy, pysam, numpy, scipy, minimap2, samtools, bcftools); consensus genomes left unpolished"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        for tool in minimap2 samtools; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                log_event WARN "$tool not found in the '{env}' env; consensus genomes left unpolished"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                exit 0
+            fi
+        done
+        if [ ! -x "$DORADO" ]; then
+            log_event WARN "dorado not found at $DORADO (dorado_binary); consensus genomes left unpolished"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        DORADO_VERSION=$("$DORADO" --version 2>&1 | tail -1)
+        ls -d "$MODELS"/*polish* >/dev/null 2>&1 \\
+            || log_event WARN "no polishing model under $MODELS (polish_models_dir); dorado will try to download one"
+        log_event OK "dorado $DORADO_VERSION; polishing at {depth}x on {device} with {threads} threads{'' if install else '; review mode (polish_install: false): consensus genomes are not replaced'}"
+
+        # One sample: everything happens in polish/<sample>.tmp, which replaces
+        # polish/<sample> only when every step has succeeded.
+        polish_sample() {{
+            local S="$1" CONS="$2" READS="$3" W="$POLISH_DIR/$1.tmp" mode
+            rm -rf "$W" && mkdir -p "$W" || return 1
+            cp "$CONS" "$W/draft.fasta" || return 1
+            python3 "$PT" stats --fastq "$READS" --out "$W/stats.json" >> "$W/polish.log" 2>&1 || return 1
+            python3 "$PT" subsample --fastq "$READS" --stats "$W/stats.json" --draft "$W/draft.fasta" \\
+                --depths {depth} --seed polish1 --prefix "$W/sub" >> "$W/polish.log" 2>&1 || return 1
+            mode=$(python3 "$PT" rgmode --stats "$W/stats.json") || return 1
+            if [ "$mode" = tags ]; then
+                python3 "$PT" rgheader --stats "$W/stats.json" --sample "$S" --basecall-model "{model_name}" \\
+                    --out "$W/rg.txt" >> "$W/polish.log" 2>&1 || return 1
+                minimap2 -ax lr:hq -y -t {threads} "$W/draft.fasta" "$W/sub.d{depth}.fastq" 2>> "$W/minimap2.log" \\
+                    | samtools view -b -o "$W/aln.u.bam" - || return 1
+                {{ samtools view -H "$W/aln.u.bam" | awk '!/^@RG/'; cat "$W/rg.txt"; }} > "$W/aln.hdr" || return 1
+                samtools reheader "$W/aln.hdr" "$W/aln.u.bam" | samtools sort -@ 4 -m 1G -o "$W/aln.bam" - || return 1
+                rm -f "$W/aln.u.bam" "$W/aln.hdr"
+            elif [ "$mode" = none ]; then
+                minimap2 -ax lr:hq -R "@RG\\tID:$S\\tPL:ONT\\tDS:basecall_model={model_name}\\tSM:$S" -t {threads} \\
+                    "$W/draft.fasta" "$W/sub.d{depth}.fastq" 2>> "$W/minimap2.log" \\
+                    | samtools sort -@ 4 -m 1G -o "$W/aln.bam" - || return 1
+            else
+                echo "some reads carry RG tags and some do not; cannot give dorado one basecall model per read" >> "$W/polish.log"
+                return 1
+            fi
+            samtools index "$W/aln.bam" || return 1
+            "$DORADO" polish "$W/aln.bam" "$W/draft.fasta" --bacteria --models-directory "$MODELS" -x {device} \\
+                -t {threads} -o "$W/dorado" --vcf --any-bam > "$W/dorado_polish.log" 2>&1 || return 1
+            python3 "$PT" changes --draft "$W/draft.fasta" --polished "$W/dorado/consensus.fasta" --bam "$W/aln.bam" \\
+                --vcf "$W/dorado/variants.vcf" --out "$W/changes.tsv" >> "$W/polish.log" 2>&1 || return 1
+            python3 "$PT" finalize --sample "$S" --draft "$W/draft.fasta" --polished "$W/dorado/consensus.fasta" \\
+                --changes "$W/changes.tsv" --stats "$W/stats.json" --subsample "$W/sub.subsample.json" \\
+                --depth {depth} --max-length-change {max_change} --out-polished "$W/polished.fasta" \\
+                --out-info "$W/info.json" --dorado-version "$DORADO_VERSION" >> "$W/polish.log" 2>&1 || return 1
+            cp "$W/dorado/variants.vcf" "$W/variants.vcf" || return 1
+            rm -rf "$W/dorado" "$W/sub.d{depth}.fastq" "$W/aln.bam" "$W/aln.bam.bai"
+            rm -rf "$POLISH_DIR/$S" && mv "$W" "$POLISH_DIR/$S"
+        }}
+        """
+    )
+    for s in samples:
+        cons = f"{layout.consensus}/{s.sample}.fasta"
+        reads = f"{layout.fastq_filtered}/{s.sample}.fastq"
+        if not install:
+            body += textwrap.dedent(
+                f"""
+                # ---- {s.sample} (review mode) ----
+                if [ ! -s {cons} ]; then
+                    log_event WARN "{s.sample}: consensus missing; not polished"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                elif python3 "$PT" is-installed --as-draft --info "$POLISH_DIR/{s.sample}/info.json" --consensus {cons}; then
+                    log_event SKIP "{s.sample} (polishing results for this consensus already in $POLISH_DIR/{s.sample})"
+                elif [ ! -s {reads} ]; then
+                    log_event WARN "{s.sample}: filtered reads missing; not polished"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                else
+                    t_s=$(date +%s)
+                    if polish_sample "{s.sample}" {cons} {reads}; then
+                        log_event OK "{s.sample} polished at {depth}x for review (consensus unchanged): $(python3 "$PT" describe --info "$POLISH_DIR/{s.sample}/info.json") in $(( $(date +%s) - t_s )) s"
+                    else
+                        log_event WARN "{s.sample}: polishing failed; logs in $POLISH_DIR/{s.sample}.tmp: $(tail -n 3 "$POLISH_DIR/{s.sample}.tmp/polish.log" "$POLISH_DIR/{s.sample}.tmp/dorado_polish.log" 2>/dev/null | tr '\\n' ' ' | cut -c1-400)"
+                        STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                    fi
+                fi
+                """
+            )
+            continue
+        used = (f'[ -e {layout.mapping}/{s.sample}/.mapping_done ] || [ -e {layout.mapping}/{s.sample}/mapped.bam ] '
+                f'|| [ -n "$(ls -A {layout.annotate}/{s.sample} 2>/dev/null)" ]')
+        body += textwrap.dedent(
+            f"""
+            # ---- {s.sample} ----
+            if [ ! -s {cons} ]; then
+                log_event WARN "{s.sample}: consensus missing; not polished"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            elif python3 "$PT" is-installed --info "$POLISH_DIR/{s.sample}/info.json" --consensus {cons}; then
+                log_event SKIP "{s.sample} (consensus is already the polished genome; delete $POLISH_DIR/{s.sample} and restore the draft to re-run)"
+            elif [ "{str(replace).lower()}" != true ] && {{ {used}; }}; then
+                log_event WARN "{s.sample}: consensus already used downstream (s13 mapping or annotation exist), so it was not replaced. To polish it, move {layout.mapping}/{s.sample} and {layout.annotate}/{s.sample} aside (or set polish_replace_existing: true) and re-run from s12b"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            elif [ ! -s {reads} ]; then
+                log_event WARN "{s.sample}: filtered reads missing; not polished"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                t_s=$(date +%s)
+                if ! polish_sample "{s.sample}" {cons} {reads}; then
+                    log_event WARN "{s.sample}: polishing failed, consensus left unpolished; logs in $POLISH_DIR/{s.sample}.tmp: $(tail -n 3 "$POLISH_DIR/{s.sample}.tmp/polish.log" "$POLISH_DIR/{s.sample}.tmp/dorado_polish.log" 2>/dev/null | tr '\\n' ' ' | cut -c1-400)"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                elif ! python3 "$PT" install --info "$POLISH_DIR/{s.sample}/info.json" \\
+                        --polished "$POLISH_DIR/{s.sample}/polished.fasta" --consensus {cons} >> "$POLISH_DIR/{s.sample}/polish.log" 2>&1; then
+                    log_event WARN "{s.sample}: polished genome could not be installed as {cons}: $(tail -n 2 "$POLISH_DIR/{s.sample}/polish.log" | tr '\\n' ' ' | cut -c1-300)"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                else
+                    log_event OK "{s.sample} polished at {depth}x: $(python3 "$PT" describe --info "$POLISH_DIR/{s.sample}/info.json") in $(( $(date +%s) - t_s )) s; draft kept as $POLISH_DIR/{s.sample}/draft.fasta"
+                fi
+            fi
+            """
+        )
+    # pipefail is on for the steps above; the final scan's grep finds nothing on a clean
+    # run and must not turn that into the script's exit status.
+    body += '\nset +o pipefail\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
 # ---- s18 annotate (Bakta for Bacteria, Prokka for Archaea) --------------
 
 def stage_annotate(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
@@ -1904,6 +2550,728 @@ def stage_classify(cfg: dict, layout: Layout, samples: List[Sample], hold: str) 
         log_warn_errors_from "$STAGE_LOG"
         """
     )
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s18b structural heterogeneity ---------------------------------------
+
+SV_ENGINE = Path(__file__).resolve().parent / "sv_genotype.py"
+
+
+def stage_sv(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str:
+    """Structural heterogeneity inside each sample (two or more versions of
+    the same genome in one culture), with sv_genotype.py.
+
+    Candidates: differences between the genome versions listed in
+    sv_variant_genomes (e.g. a strain and its deletion mutant) and, with
+    sv_discovery, Sniffles2 calls on each sample's s13 mapping. Every
+    candidate is re-genotyped against explicit allele sequences: a read counts
+    for an allele only if one alignment spans that allele's whole window, and
+    all alleles share one window length, so fractions are not biased by allele
+    length. Events longer than the reads are genotyped at their breakpoint
+    junctions instead (sv_junction_mode). Each sample gets an empirical
+    detection floor from size-matched fake events at unique positions. Every
+    locus is typed in every sample whose consensus contains its flanks.
+    Outputs: sv/events.tsv, sv/null_loci.tsv, sv/summary.json,
+    sv/sample_summary.tsv, sv/<sample>/ (alleles, read lists, Sniffles2 VCF).
+    """
+    name = "s18b_sv"
+    threads = int(cfg.get("sv_threads", 8))
+    env = cfg.get("conda_env_sv", "sv")
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg.get("sge_h_vmem_sv", "4G"),
+        threads, cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(env) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+
+    enabled = bool(cfg.get("sv_enabled", True))
+    discovery = bool(cfg.get("sv_discovery", True))
+    variants = [os.path.expandvars(os.path.expanduser(str(v))) for v in (cfg.get("sv_variant_genomes") or [])]
+    jmode = str(cfg.get("sv_junction_mode", "auto"))
+    min_len = int(cfg.get("sv_min_len", 500))
+    anchor = int(cfg.get("sv_anchor", 1000))
+    min_alt = int(cfg.get("sv_min_alt_reads", 5))
+    min_frac = float(cfg.get("sv_min_fraction", 0.01))
+    min_span = int(cfg.get("sv_min_spanning", 20))
+    n_null = int(cfg.get("sv_null_loci", 20))
+    max_reads = int(cfg.get("sv_max_reads", 3000))
+    max_span = int(cfg.get("sv_max_span_window", 20000))
+    engine = layout.submit_dir / "_sv_genotype.py"
+    if enabled:
+        problems = []
+        if not SV_ENGINE.is_file():
+            problems.append(f"{SV_ENGINE} is missing (it ships next to generate_pipeline.py)")
+        missing = [v for v in variants if not Path(v).is_file()]
+        if missing:
+            problems.append("sv_variant_genomes not found: " + ", ".join(missing))
+        if len(variants) == 1:
+            problems.append("sv_variant_genomes needs two or more genome versions (or none)")
+        if jmode not in ("auto", "always", "never"):
+            problems.append(f"sv_junction_mode must be auto, always or never (got {jmode!r})")
+        if (not 0 < min_frac < 0.5 or min_len < 50 or anchor < 200 or min_alt < 1 or min_span < 1 or n_null < 0
+                or max_span < 2 * anchor):
+            problems.append("sv_min_fraction must be in (0, 0.5); sv_min_len >= 50; sv_anchor >= 200; "
+                            "sv_min_alt_reads, sv_min_spanning >= 1; sv_null_loci >= 0; sv_max_span_window >= 2 x sv_anchor")
+        if problems:
+            raise SystemExit("pipeline_config.yaml (s18b_sv): " + "; ".join(problems))
+        shutil.copyfile(SV_ENGINE, engine)
+        engine.chmod(engine.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    body += textwrap.dedent(
+        f"""
+        # OpenBLAS (pulled in by numpy) reserves memory per core at import; under
+        # h_vmem on many-core nodes that alone can exceed the limit.
+        export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+        SV_DIR={layout.sv}
+        mkdir -p "$SV_DIR"
+        """
+    )
+    if not enabled:
+        body += 'log_event SKIP "structural-heterogeneity stage disabled (sv_enabled: false)"\nexit 0\n'
+        write_script(layout.submit_dir / f"{name}.sh", body)
+        return name
+    if not variants and not discovery:
+        body += ('log_event SKIP "no candidate source: sv_variant_genomes is empty and sv_discovery is false"\n'
+                 'exit 0\n')
+        write_script(layout.submit_dir / f"{name}.sh", body)
+        return name
+
+    vg_arg = ("--variant-genomes " + " ".join(f'"{v}"' for v in variants)) if variants else ""
+    opts = (f"--min-len {min_len} --anchor {anchor} --min-alt-reads {min_alt} --min-fraction {min_frac} "
+            f"--min-spanning {min_span} --null-loci {n_null} --max-reads {max_reads} --junction-mode {jmode} "
+            f"--max-span-window {max_span}")
+    body += textwrap.dedent(
+        f"""
+        if [ -s "$SV_DIR/events.tsv" ] && [ -f "$SV_DIR/.complete" ]; then
+            log_event SKIP "results already in $SV_DIR (delete that directory to re-run)"
+            exit 0
+        fi
+        if ! python3 -c "import mappy, pysam" 2>/dev/null; then
+            log_event WARN "the '{env}' conda env lacks mappy/pysam (needs python>=3.9, mappy, pysam, sniffles>=2.2, samtools); skipping"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        DISC="{'--discovery' if discovery else ''}"
+        if [ -n "$DISC" ] && ! command -v sniffles >/dev/null 2>&1; then
+            log_event WARN "sniffles not found in the '{env}' env; genotyping the supplied genome versions only"
+            DISC=""
+        fi
+        if [ -z "$DISC" ] && [ -z '{vg_arg}' ]; then
+            log_event WARN "no candidate source left (no sniffles, no sv_variant_genomes); skipping"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        : > "$SV_DIR/samples.tsv.tmp"
+        """
+    )
+    for s in samples:
+        cons = f"{layout.consensus}/{s.sample}.fasta"
+        bam = f"{layout.mapping}/{s.sample}/mapped.bam"
+        adir = f"{layout.annotate}/{s.sample}"
+        body += textwrap.dedent(
+            f"""
+            # ---- {s.sample} ----
+            gff=""
+            for g in {adir}/{s.sample}.gff3 {adir}/{s.sample}.gff; do
+                if [ -s "$g" ]; then gff="$g"; break; fi
+            done
+            fna={adir}/{s.sample}.fna
+            [ -s "$fna" ] || fna=""
+            if [ ! -s {cons} ] || [ ! -s {bam} ] || [ ! -s {bam}.bai ]; then
+                log_event WARN "{s.sample}: consensus or indexed s13 mapping (mapped.bam + .bai) missing; not genotyped"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "{s.sample}" {cons} {bam} "$gff" "$fna" >> "$SV_DIR/samples.tsv.tmp"
+                [ -n "$gff" ] || log_event WARN "{s.sample}: no annotation GFF; genes in variable segments will not be listed"
+            fi
+            """
+        )
+    body += textwrap.dedent(
+        f"""
+        mv "$SV_DIR/samples.tsv.tmp" "$SV_DIR/samples.tsv"
+        n_s=$(wc -l < "$SV_DIR/samples.tsv")
+        if [ "$n_s" -eq 0 ]; then
+            log_event WARN "no sample has a consensus + indexed mapping; nothing to genotype"
+            exit 0
+        fi
+        log_event OK "genotyping structural heterogeneity in $n_s sample(s): {len(variants)} supplied genome version(s), discovery $([ -n "$DISC" ] && echo on || echo off), junction mode {jmode}"
+        set +e
+        python3 {engine} --samples "$SV_DIR/samples.tsv" --outdir "$SV_DIR" $DISC {vg_arg} \\
+            --threads {threads} {opts} > "$SV_DIR/sv_genotype.log" 2>&1
+        rc=$?
+        set -e
+        if [ $rc -ne 0 ] || [ ! -s "$SV_DIR/events.tsv" ]; then
+            log_event WARN "sv_genotype rc=$rc; last lines: $(tail -3 "$SV_DIR/sv_genotype.log" | tr '\\n' ' ' | cut -c1-400)"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+        else
+            tail -n +2 "$SV_DIR/sample_summary.tsv" | while IFS=$'\\t' read -r smp nloc nkn ndi mix dis sgl nsup ins rl und rep; do
+                log_event OK "$smp: $nloc loci ($nkn known, $ndi discovered); mixture $mix, consensus_discrepancy $dis, single $sgl, not_supported $nsup, insufficient reads $ins, repeat-limited $rl"
+                [ "$rep" = "-" ] || log_event OK "$smp: $(printf '%s' "$rep" | cut -c1-900)"
+            done
+            touch "$SV_DIR/.complete"
+            log_event OK "results: $SV_DIR/events.tsv (per locus), $SV_DIR/sample_summary.tsv, $SV_DIR/sv_genotype.log"
+        fi
+        """
+    )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s18c small variants between samples and references --------------------
+
+SNV_ENGINE = Path(__file__).resolve().parent / "snv_tools.py"
+SNV_CALLERS = ("C3P", "C3AF", "DP", "INT", "UNI")
+
+
+def _snv_references(cfg: dict) -> List[tuple]:
+    """snv_references entries: a FASTA path, or a mapping with fasta (and optional gff, name)."""
+    out = []
+    for e in cfg.get("snv_references") or []:
+        if isinstance(e, dict):
+            fa = os.path.expandvars(os.path.expanduser(str(e.get("fasta", ""))))
+            gff = os.path.expandvars(os.path.expanduser(str(e.get("gff") or "")))
+            nm = str(e.get("name") or "")
+        else:
+            fa, gff, nm = os.path.expandvars(os.path.expanduser(str(e))), "", ""
+        if not nm:
+            nm = Path(fa).name
+            for ext in (".gz", ".fasta", ".fna", ".fa", ".fas"):
+                if nm.endswith(ext):
+                    nm = nm[: -len(ext)]
+        out.append((nm, fa, gff))
+    return out
+
+
+def stage_snv(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str | None:
+    """Small variants (SNPs, indels) between samples and against references (s18c).
+
+    Written only with snv_enabled: true. Comparisons, each a mapping of one
+    sample's reads to one genome: self (the sample's own consensus: residual
+    errors), cross (the consensus of a near-identical sample, e.g. replicate
+    or parent; groups are formed from measured identity and aligned fraction and
+    the first sample of a group in samplesheet order is its reference) and
+    reference (each genome in snv_references that is close enough to the
+    sample). Reads: a deterministic snv_depth-fold subsample mapped with
+    minimap2 -x lr:hq; caller configuration snv_caller (validated: README,
+    rule R2). Every call gets strand-resolved read support, repeat and
+    homopolymer flags, gene effect (the reference's GFF, the sample's annotation
+    for self/cross, or the sample's annotation lifted over to an external
+    reference) and whether the two assemblies also differ there.
+    Outputs: snv/comparisons.tsv, snv/calls.tsv, snv/plan.tsv,
+    snv/similarity.tsv, snv/<comparison>/.
+    """
+    if not bool(cfg.get("snv_enabled", False)):
+        return None
+    name = "s18c_snv"
+    threads = int(cfg.get("snv_threads", 16))
+    env = cfg.get("conda_env_snv", "snv")
+    caller = str(cfg.get("snv_caller", SNV_DEFAULT_CALLER))
+    depth = int(cfg.get("snv_depth", SNV_DEFAULT_DEPTH))
+    refs = _snv_references(cfg)
+    do_self = bool(cfg.get("snv_self", True))
+    do_cross = bool(cfg.get("snv_cross", True))
+    cross_id = float(cfg.get("snv_cross_min_identity", 0.999))
+    cross_al = float(cfg.get("snv_cross_min_aligned", 0.9))
+    ref_id = float(cfg.get("snv_ref_min_identity", 0.99))
+    ref_al = float(cfg.get("snv_ref_min_aligned", 0.8))
+    min_af = float(cfg.get("snv_clair3_min_af", 0.65))
+    clair3_env = str(cfg.get("conda_env_clair3", "clair3"))
+    clair3_model = os.path.expandvars(os.path.expanduser(str(cfg.get("snv_clair3_model") or "")))
+    model_name = Path(str(cfg["basecall_model"])).name
+    models_dir = str(cfg.get("polish_models_dir") or Path(str(cfg["basecall_model"])).parent)
+    uses_clair3 = caller != "DP"
+    uses_dorado = caller in ("DP", "INT", "UNI")
+    problems = []
+    if not SNV_ENGINE.is_file() or not POLISH_ENGINE.is_file():
+        problems.append("snv_tools.py and polish_tools.py must ship next to generate_pipeline.py")
+    if caller not in SNV_CALLERS:
+        problems.append(f"snv_caller must be one of {', '.join(SNV_CALLERS)} (got {caller!r})")
+    if not 5 <= depth <= 500:
+        problems.append("snv_depth must be between 5 and 500")
+    if uses_clair3 and not Path(clair3_model).is_dir():
+        problems.append(f"snv_clair3_model is not a directory: {clair3_model!r}")
+    missing = [fa for _, fa, _ in refs if not Path(fa).is_file()] + [g for _, _, g in refs if g and not Path(g).is_file()]
+    if missing:
+        problems.append("snv_references not found: " + ", ".join(missing))
+    names = [n for n, _, _ in refs]
+    if len(set(names)) != len(names) or set(names) & {s.sample for s in samples}:
+        problems.append("snv_references names must be unique and differ from sample names")
+    if not (0.9 <= cross_id <= 1 and 0.9 <= ref_id <= 1 and 0 < cross_al <= 1 and 0 < ref_al <= 1 and 0.5 <= min_af < 1):
+        problems.append("snv_cross_min_identity / snv_ref_min_identity in [0.9, 1]; aligned fractions in (0, 1]; "
+                        "snv_clair3_min_af in [0.5, 1)")
+    if problems:
+        raise SystemExit("pipeline_config.yaml (s18c_snv): " + "; ".join(problems))
+    st_engine = layout.submit_dir / "_snv_tools.py"
+    pt_engine = layout.submit_dir / "_polish_tools.py"
+    for src, dst in ((SNV_ENGINE, st_engine), (POLISH_ENGINE, pt_engine)):
+        shutil.copyfile(src, dst)
+        dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg.get("sge_h_vmem_snv", "6G"),
+        threads, cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(env) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    snv = layout.root / "snv"
+    ref_lines = "".join(f"printf '%s\\t%s\\t%s\\n' \"{n}\" \"{fa}\" \"{g}\" >> \"$SNV_DIR/references.tsv\"\n"
+                        for n, fa, g in refs)
+    plan_flags = ("--self " if do_self else "") + ("--cross " if do_cross else "")
+    body += textwrap.dedent(
+        f"""
+        export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+        set +e
+        set -o pipefail
+        SNV_DIR={snv}
+        ST={st_engine}
+        PT={pt_engine}
+        DORADO={cfg['dorado_binary']}
+        mkdir -p "$SNV_DIR"
+        if [ -s "$SNV_DIR/comparisons.tsv" ] && [ -f "$SNV_DIR/.complete" ]; then
+            log_event SKIP "results already in $SNV_DIR (delete that directory to re-run)"
+            exit 0
+        fi
+        if ! python3 -c "import mappy, pysam, numpy" 2>/dev/null; then
+            log_event WARN "the '{env}' conda env lacks mappy/pysam/numpy (needs python>=3.9, mappy, pysam, numpy, scipy, minimap2, samtools, bcftools); skipping"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        for tool in minimap2 samtools bcftools; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+                log_event WARN "$tool not found in the '{env}' env; skipping"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                exit 0
+            fi
+        done
+        CL3=""
+        if [ "{str(uses_clair3).lower()}" = true ]; then
+            CL3="{clair3_env}"
+            case "$CL3" in
+                /*) ;;
+                *) CL3=$(conda env list 2>/dev/null | awk -v n="$CL3" '$1 == n {{print $NF}}' | head -1) ;;
+            esac
+            if [ -z "$CL3" ] || [ ! -x "$CL3/bin/run_clair3.sh" ]; then
+                log_event WARN "Clair3 (run_clair3.sh) not found in conda env '{clair3_env}' (conda_env_clair3); skipping"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                exit 0
+            fi
+        fi
+        if [ "{str(uses_dorado).lower()}" = true ] && [ ! -x "$DORADO" ]; then
+            log_event WARN "dorado not found at $DORADO (dorado_binary); skipping"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        : > "$SNV_DIR/samples.tsv.tmp"
+        : > "$SNV_DIR/references.tsv"
+        """
+    )
+    body += ref_lines
+    for s in samples:
+        cons = f"{layout.consensus}/{s.sample}.fasta"
+        reads = f"{layout.fastq_filtered}/{s.sample}.fastq"
+        adir = f"{layout.annotate}/{s.sample}"
+        body += textwrap.dedent(
+            f"""
+            # ---- {s.sample} ----
+            gff=""
+            for g in {adir}/{s.sample}.gff3 {adir}/{s.sample}.gff; do
+                if [ -s "$g" ]; then gff="$g"; break; fi
+            done
+            fna={adir}/{s.sample}.fna
+            [ -s "$fna" ] || fna=""
+            if [ ! -s {cons} ] || [ ! -s {reads} ]; then
+                log_event WARN "{s.sample}: consensus or filtered reads missing; no comparisons"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                printf '%s\\t%s\\t%s\\t%s\\t%s\\n' "{s.sample}" {cons} {reads} "$gff" "$fna" >> "$SNV_DIR/samples.tsv.tmp"
+                [ -n "$gff" ] || log_event WARN "{s.sample}: no annotation GFF; effects will read no_annotation"
+            fi
+            """
+        )
+    body += textwrap.dedent(
+        f"""
+        mv "$SNV_DIR/samples.tsv.tmp" "$SNV_DIR/samples.tsv"
+        if [ ! -s "$SNV_DIR/samples.tsv" ]; then
+            log_event WARN "no sample has a consensus and reads; nothing to compare"
+            exit 0
+        fi
+        if ! python3 "$ST" plan --samples "$SNV_DIR/samples.tsv" --references "$SNV_DIR/references.tsv" {plan_flags}\\
+                --cross-min-identity {cross_id} --cross-min-aligned {cross_al} --ref-min-identity {ref_id} \\
+                --ref-min-aligned {ref_al} --out "$SNV_DIR/plan.tsv" --out-similarity "$SNV_DIR/similarity.tsv" \\
+                > "$SNV_DIR/plan.log" 2>&1; then
+            log_event WARN "comparison planning failed: $(tail -3 "$SNV_DIR/plan.log" | tr '\\n' ' ' | cut -c1-400)"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        log_event OK "planned comparisons $(tail -1 "$SNV_DIR/plan.log"); caller {caller} at {depth}x; pairwise identities in $SNV_DIR/similarity.tsv"
+        while IFS= read -r cmp; do
+            if [ -f "$SNV_DIR/$cmp/.done" ]; then
+                log_event SKIP "$cmp (already done)"
+                continue
+            fi
+            rm -rf "$SNV_DIR/$cmp"
+            t_c=$(date +%s)
+            if python3 "$ST" run --plan "$SNV_DIR/plan.tsv" --comparison "$cmp" --outdir "$SNV_DIR/$cmp" \\
+                    --depth {depth} --caller {caller} --threads {threads} --af {min_af} --polish-tools "$PT" \\
+                    --stats-dir "$SNV_DIR/_read_stats" --basecall-model "{model_name}" --clair3-prefix "$CL3" \\
+                    --clair3-model "{clair3_model}" --dorado "$DORADO" --models-dir "{models_dir}" --device cpu \\
+                    > "$SNV_DIR/$cmp.log" 2>&1; then
+                log_event OK "$cmp: $(tail -1 "$SNV_DIR/$cmp.log" | cut -c1-200) in $(( $(date +%s) - t_c )) s"
+            else
+                log_event WARN "$cmp failed: $(tail -4 "$SNV_DIR/$cmp.log" | tr '\\n' ' ' | cut -c1-500)"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            fi
+        done < <(tail -n +2 "$SNV_DIR/plan.tsv" | cut -f1)
+        if python3 "$ST" collect --plan "$SNV_DIR/plan.tsv" --snv-dir "$SNV_DIR" > "$SNV_DIR/collect.log" 2>&1; then
+            # awk, not read: empty TSV fields would shift bash read's variables
+            awk -F'\\t' 'NR == 1 {{ for (i = 1; i <= NF; i++) h[$i] = i; next }}
+                {{ m = $h["comparison"] ": " $h["n_calls"] " calls (" $h["n_snp"] " SNP, " $h["n_indel"] " indel, " $h["n_mnp_complex"] " MNP/complex; " $h["n_coding_change"] " change a protein)"
+                  if ($h["kind"] != "self") m = m "; assemblies differ at " $h["assembly_diffs"] " small sites, " $h["assembly_diffs_without_call"] " of them without a call; " $h["calls_not_in_assembly_diff"] " calls where the assemblies agree"
+                  if ($h["status"] != "ok") m = m " [" $h["status"] "]"
+                  print m }}' "$SNV_DIR/comparisons.tsv" | while IFS= read -r line; do log_event OK "$line"; done
+            [ "$STAGE_FAIL_COUNT" -eq 0 ] && touch "$SNV_DIR/.complete"
+            log_event OK "results: $SNV_DIR/comparisons.tsv, $SNV_DIR/calls.tsv"
+        else
+            log_event WARN "collecting results failed: $(tail -3 "$SNV_DIR/collect.log" | tr '\\n' ' ' | cut -c1-300)"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+        fi
+        """
+    )
+    # pipefail is on for the steps above; the final scan's grep finds nothing on a clean
+    # run and must not turn that into the script's exit status.
+    body += '\nset +o pipefail\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s18d minority variants within samples -------------------------------
+
+MINOR_ENGINE = Path(__file__).resolve().parent / "minor_variants.py"
+
+
+def stage_minor(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str | None:
+    """Minority single-nucleotide variants inside each sample (s18d).
+
+    Written only with minor_enabled: true. On each sample's s13 mapping,
+    minor_variants.py counts bases per strand, learns the sample's own error
+    rates per sequence context (k-mer and homopolymer classes, beta-binomial),
+    tests every position on both strands (Benjamini-Hochberg over all tests),
+    removes strand-biased and context-enriched candidates, masks repeats and
+    contig ends, reports error-corrected fractions with 95% intervals and links
+    sites carried by the same reads into groups (haplotypes). Genome versions in
+    sv_variant_genomes are also genotyped at their SNP sites.
+    Outputs: minor/<sample>/{sites,groups,summary,null_model}.tsv (+ known_*.tsv),
+    minor/summary.tsv.
+    """
+    if not bool(cfg.get("minor_enabled", False)):
+        return None
+    name = "s18d_minor"
+    env = cfg.get("conda_env_snv", "snv")
+    fdr = float(cfg.get("minor_fdr", 0.01))
+    min_alt = int(cfg.get("minor_min_alt_per_strand", 3))
+    min_sd = int(cfg.get("minor_min_strand_depth", 20))
+    min_bq = int(cfg.get("minor_min_baseq", 10))
+    min_mq = int(cfg.get("minor_min_mapq", 20))
+    end_mask = int(cfg.get("minor_end_mask", 500))
+    max_depth = float(cfg.get("minor_max_depth", 2000))
+    parallel = int(cfg.get("minor_parallel", 4))
+    variants = [os.path.expandvars(os.path.expanduser(str(v))) for v in (cfg.get("sv_variant_genomes") or [])]
+    problems = []
+    if not MINOR_ENGINE.is_file():
+        problems.append(f"{MINOR_ENGINE} is missing (it ships next to generate_pipeline.py)")
+    if not 0 < fdr <= 0.1:
+        problems.append("minor_fdr must be in (0, 0.1]")
+    if (min_alt < 2 or min_sd < 10 or not 0 <= min_bq <= 60 or not 0 <= min_mq <= 60 or end_mask < 0
+            or max_depth < 0 or parallel < 1):
+        problems.append("minor_min_alt_per_strand >= 2; minor_min_strand_depth >= 10; minor_min_baseq and "
+                        "minor_min_mapq in [0, 60]; minor_end_mask, minor_max_depth >= 0; minor_parallel >= 1")
+    missing = [v for v in variants if not Path(v).is_file()]
+    if missing:
+        problems.append("sv_variant_genomes not found: " + ", ".join(missing))
+    if problems:
+        raise SystemExit("pipeline_config.yaml (s18d_minor): " + "; ".join(problems))
+    engine = layout.submit_dir / "_minor_variants.py"
+    shutil.copyfile(MINOR_ENGINE, engine)
+    engine.chmod(engine.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    slots = max(1, min(parallel, len(samples)))
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg.get("sge_h_vmem_minor", "8G"),
+        slots, cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(env) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    minor = layout.root / "minor"
+    ver = " ".join(f'--version "{v}"' for v in variants) if len(variants) >= 2 else ""
+    opts = (f"--fdr {fdr} --min-alt-per-strand {min_alt} --min-strand-depth {min_sd} --min-baseq {min_bq} "
+            f"--min-mapq {min_mq} --end-mask {end_mask} --max-depth {max_depth:g}")
+    body += textwrap.dedent(
+        f"""
+        export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+        set +e
+        MINOR_DIR={minor}
+        ME={engine}
+        mkdir -p "$MINOR_DIR"
+        if ! python3 -c "import mappy, pysam, numpy, scipy" 2>/dev/null; then
+            log_event WARN "the '{env}' conda env lacks mappy/pysam/numpy/scipy; skipping"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            exit 0
+        fi
+        """
+    )
+    body += textwrap.dedent(
+        f"""
+        # Samples run in parallel ({slots} at a time); each writes its exit code to
+        # minor/<sample>.rc and is reported once all have finished.
+        run_minor() {{
+            local S="$1"; shift
+            python3 "$ME" call --sample "$S" --outdir "$MINOR_DIR/$S" "$@" {opts} > "$MINOR_DIR/$S.log" 2>&1
+            echo $? > "$MINOR_DIR/$S.rc"
+        }}
+        LAUNCHED=""
+        """
+    )
+    for s in samples:
+        cons = f"{layout.consensus}/{s.sample}.fasta"
+        bam = f"{layout.mapping}/{s.sample}/mapped.bam"
+        adir = f"{layout.annotate}/{s.sample}"
+        body += textwrap.dedent(
+            f"""
+            # ---- {s.sample} ----
+            gff=""
+            for g in {adir}/{s.sample}.gff3 {adir}/{s.sample}.gff; do
+                if [ -s "$g" ]; then gff="$g"; break; fi
+            done
+            fna={adir}/{s.sample}.fna
+            [ -s "$fna" ] || fna=""
+            if [ -f "$MINOR_DIR/{s.sample}/.done" ]; then
+                log_event SKIP "{s.sample} (already done; delete $MINOR_DIR/{s.sample} to re-run)"
+            elif [ ! -s {cons} ] || [ ! -s {bam} ] || [ ! -s {bam}.bai ]; then
+                log_event WARN "{s.sample}: consensus or indexed s13 mapping (mapped.bam + .bai) missing; not assessed"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                rm -rf "$MINOR_DIR/{s.sample}" "$MINOR_DIR/{s.sample}.rc"
+                while [ "$(jobs -rp | wc -l)" -ge {slots} ]; do sleep 10; done
+                run_minor "{s.sample}" --bam {bam} --ref {cons} --gff "$gff" --gff-fasta "$fna" {ver} &
+                LAUNCHED="$LAUNCHED {s.sample}"
+                log_event OK "{s.sample}: started"
+            fi
+            """
+        )
+    body += textwrap.dedent(
+        f"""
+        wait
+        for S in $LAUNCHED; do
+            rc=$(cat "$MINOR_DIR/$S.rc" 2>/dev/null || echo missing)
+            if [ "$rc" = 0 ] && [ -s "$MINOR_DIR/$S/summary.tsv" ]; then
+                touch "$MINOR_DIR/$S/.done"
+                log_event OK "$S: $(awk -F'\\t' 'NR == 1 {{ for (i = 1; i <= NF; i++) h[$i] = i; next }} {{ printf "%s called and %s linked minority sites in %s groups; %s bp assessed at median depth %s (read fraction used %s), median detection floor %s; %s s", $h["n_called"], $h["n_linked"], $h["n_groups"], $h["positions_assessed"], $h["median_depth"], $h["read_fraction_used"], $h["floor_median"], $h["seconds"] }}' "$MINOR_DIR/$S/summary.tsv")"
+            else
+                log_event WARN "$S: minority-variant engine failed (rc=$rc): $(tail -3 "$MINOR_DIR/$S.log" | tr '\\n' ' ' | cut -c1-400)"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            fi
+            rm -f "$MINOR_DIR/$S.rc"
+        done
+        """
+    )
+    body += textwrap.dedent(
+        f"""
+        # run-level summary: one row per sample
+        first=1
+        : > "$MINOR_DIR/summary.tsv.tmp"
+        for f in {" ".join(f'"$MINOR_DIR/{s.sample}/summary.tsv"' for s in samples)}; do
+            [ -s "$f" ] || continue
+            if [ $first -eq 1 ]; then cat "$f"; first=0; else tail -n +2 "$f"; fi >> "$MINOR_DIR/summary.tsv.tmp"
+        done
+        mv "$MINOR_DIR/summary.tsv.tmp" "$MINOR_DIR/summary.tsv"
+        log_event OK "results: $MINOR_DIR/<sample>/sites.tsv, groups.tsv; run summary $MINOR_DIR/summary.tsv"
+        """
+    )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
+    write_script(layout.submit_dir / f"{name}.sh", body)
+    return name
+
+
+# ---- s18e phase variation (PhaVa) ---------------------------------------
+
+PHAVA_ENGINE = Path(__file__).resolve().parent / "phava_tools.py"
+
+
+def stage_phava(cfg: dict, layout: Layout, samples: List[Sample], hold: str) -> str | None:
+    """Phase variation: invertible DNA segments with PhaVa (s18e).
+
+    Written only with phava_enabled: true. For each sample, phava_tools.py turns
+    the annotation into the GFF that PhaVa reads (region lines, consensus contig
+    names, transl_table, no FASTA section) and subsamples the filtered reads by
+    read name to phava_max_depth; PhaVa 0.2.3 (variation_wf --reportAll) finds
+    inverted repeats in the consensus with einverted and counts the reads that
+    support each orientation of every candidate inverton; phava_tools.py
+    genotype re-counts every candidate with an inverted read against its own two
+    orientations only (PhaVa's joint mapping loses reference-orientation reads
+    where candidates are close, inflating the inverted fraction), using the s13
+    mapping to find the reads; phava_tools.py annotate adds the reverse fraction
+    with a 95% interval, the call (at least phava_min_reverse_reads reads in the
+    inverted orientation, making up at least phava_min_reverse_fraction of the
+    counted reads) and the gene context.
+    Outputs: phava/<sample>/{invertons,summary,genotype,phava_ratio,phava_IRs}.tsv (+ the
+    GFF PhaVa used, phava_genes.gff), phava/{summary,invertons_called,invertons_all}.tsv.
+    """
+    if not bool(cfg.get("phava_enabled", False)):
+        return None
+    name = "s18e_phava"
+    env = cfg.get("conda_env_phava", "phava")
+    max_depth = float(cfg.get("phava_max_depth", 1000))
+    min_rev = int(cfg.get("phava_min_reverse_reads", 3))
+    min_frac = float(cfg.get("phava_min_reverse_fraction", 0.03))
+    threads = int(cfg.get("phava_threads", 4))
+    parallel = int(cfg.get("phava_parallel", 4))
+    problems = []
+    if not PHAVA_ENGINE.is_file():
+        problems.append(f"{PHAVA_ENGINE} is missing (it ships next to generate_pipeline.py)")
+    if max_depth < 0 or min_rev < 1 or not 0 <= min_frac < 1 or threads < 1 or parallel < 1:
+        problems.append("phava_max_depth >= 0; phava_min_reverse_reads >= 1; phava_min_reverse_fraction "
+                        "in [0, 1); phava_threads and phava_parallel >= 1")
+    if problems:
+        raise SystemExit("pipeline_config.yaml (s18e_phava): " + "; ".join(problems))
+    engine = layout.submit_dir / "_phava_tools.py"
+    shutil.copyfile(PHAVA_ENGINE, engine)
+    engine.chmod(engine.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    par = max(1, min(parallel, len(samples)))
+    body = sge_header(
+        name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg.get("sge_h_vmem_phava", "4G"),
+        par * threads, cfg["email"], hold_jid=hold,
+    )
+    body += conda_block(env) + "\n\n"
+    body += log_setup(name, layout) + "\n\n"
+    phava = layout.root / "phava"
+    opts = f"--min-reverse-reads {min_rev} --min-reverse-fraction {min_frac:g} --promoter-window 300"
+    body += textwrap.dedent(
+        f"""
+        # numpy/OpenBLAS (imported by PhaVa) reserves buffers for every core of the node,
+        # which breaks the h_vmem limit on large nodes.
+        export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+        set +e
+        PHAVA_DIR={phava}
+        PT={engine}
+        mkdir -p "$PHAVA_DIR"
+        for t in phava einverted minimap2; do
+            if ! command -v "$t" > /dev/null 2>&1; then
+                log_event WARN "the '{env}' conda env lacks $t (phava 0.2.3 from bioconda brings all three); skipping"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                exit 0
+            fi
+        done
+        PHAVA_VERSION=$(phava -h 2>&1 | grep -o 'PhaVa v[0-9.]*' | head -n 1 | cut -c8-)
+        """
+    )
+    body += textwrap.dedent(
+        f"""
+        # Samples run in parallel ({par} at a time, {threads} threads each); each writes its
+        # exit code to phava/<sample>.rc and is reported once all have finished. PhaVa
+        # names its outputs after the read and genome files, so both are named <sample>.
+        run_phava() {{
+            local S="$1" CONS="$2" FASTQ="$3" GFF="$4" FNA="$5" BAM="$6"
+            local D="$PHAVA_DIR/$S"
+            local W="$PHAVA_DIR/$S/work"
+            (
+                set -e
+                mkdir -p "$W"
+                cp "$CONS" "$W/$S.fasta"
+                GOPT=""
+                if [ -n "$GFF" ]; then
+                    python3 "$PT" gff --gff "$GFF" --fna "$FNA" --consensus "$W/$S.fasta" \\
+                        --out "$D/phava_genes.gff" --json "$D/phava_genes.json"
+                    GOPT="--genes $D/phava_genes.gff --genesFormat gff"
+                fi
+                python3 "$PT" subsample --fastq "$FASTQ" --genome "$W/$S.fasta" --max-depth {max_depth:g} \\
+                    --seed phava1 --out "$W/$S.fastq" --json "$D/subsample.json"
+                [ -e "$W/$S.fastq" ] || ln -s "$FASTQ" "$W/$S.fastq"
+                phava variation_wf -i "$W/$S.fasta" -r "$W/$S.fastq" -d "$W/phava" -t {threads} $GOPT \\
+                    --reportAll > "$W/phava.stdout"
+                cp "$W/phava/$S.fastq_vs_$S.fasta_ratio.tsv" "$D/phava_ratio.tsv"
+                cp "$W/phava/data/IRs.tsv" "$D/phava_IRs.tsv"
+                cp "$W/phava/Phava.log" "$D/phava.log"
+                GT=""
+                if [ -n "$BAM" ]; then
+                    python3 "$PT" genotype --ratio "$D/phava_ratio.tsv" --consensus "$W/$S.fasta" --bam "$BAM" \\
+                        --fastq "$W/$S.fastq" --subsample-json "$D/subsample.json" --threads {threads} \\
+                        --tmp "$W" --out "$D/genotype.tsv"
+                    GT="--genotype $D/genotype.tsv"
+                fi
+                python3 "$PT" annotate --ratio "$D/phava_ratio.tsv" --consensus "$W/$S.fasta" --gff "$GFF" \\
+                    --fna "$FNA" --sample "$S" {opts} --subsample-json "$D/subsample.json" $GT \\
+                    --phava-version "$PHAVA_VERSION" --out "$D/invertons.tsv" --summary "$D/summary.tsv"
+                rm -rf "$W"
+            ) > "$D.log" 2>&1
+            echo $? > "$D.rc"
+        }}
+        LAUNCHED=""
+        """
+    )
+    for s in samples:
+        cons = f"{layout.consensus}/{s.sample}.fasta"
+        reads = f"{layout.fastq_filtered}/{s.sample}.fastq"
+        adir = f"{layout.annotate}/{s.sample}"
+        bam = f"{layout.mapping}/{s.sample}/mapped.bam"
+        body += textwrap.dedent(
+            f"""
+            # ---- {s.sample} ----
+            bam={bam}
+            [ -s "$bam" ] && [ -s "$bam.bai" ] || bam=""
+            gff=""
+            for g in {adir}/{s.sample}.gff3 {adir}/{s.sample}.gff; do
+                if [ -s "$g" ]; then gff="$g"; break; fi
+            done
+            fna={adir}/{s.sample}.fna
+            [ -s "$fna" ] || fna=""
+            if [ -f "$PHAVA_DIR/{s.sample}/.done" ]; then
+                log_event SKIP "{s.sample} (already done; delete $PHAVA_DIR/{s.sample} to re-run)"
+            elif [ ! -s {cons} ] || [ ! -s {reads} ]; then
+                log_event WARN "{s.sample}: consensus or filtered reads missing; not assessed"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            else
+                [ -n "$gff" ] || log_event WARN "{s.sample}: no annotation; invertons without gene context"
+                [ -n "$bam" ] || log_event WARN "{s.sample}: no indexed s13 mapping; fractions are PhaVa's joint counts (not re-counted)"
+                rm -rf "$PHAVA_DIR/{s.sample}" "$PHAVA_DIR/{s.sample}.rc"
+                while [ "$(jobs -rp | wc -l)" -ge {par} ]; do sleep 10; done
+                run_phava "{s.sample}" {cons} {reads} "$gff" "$fna" "$bam" &
+                LAUNCHED="$LAUNCHED {s.sample}"
+                log_event OK "{s.sample}: started"
+            fi
+            """
+        )
+    body += textwrap.dedent(
+        f"""
+        wait
+        for S in $LAUNCHED; do
+            rc=$(cat "$PHAVA_DIR/$S.rc" 2>/dev/null || echo missing)
+            if [ "$rc" = 0 ] && [ -s "$PHAVA_DIR/$S/summary.tsv" ]; then
+                touch "$PHAVA_DIR/$S/.done"
+                log_event OK "$S: $(awk -F'\\\\t' 'NR == 1 {{ for (i = 1; i <= NF; i++) h[$i] = i; next }} {{ printf "%s candidate invertons, %s spanned by reads, %s with inverted reads, %s called (%s intergenic, %s at a gene boundary, %s intragenic) at %sx; %s re-counted alone (PhaVa joint counts: %s called)", $h["candidates"], $h["spanned"], $h["with_reverse_reads"], $h["called"], $h["called_intergenic"], $h["called_gene_boundary"], $h["called_intragenic"], $h["depth_used"], $h["regenotyped"], $h["phava_called"] }}' "$PHAVA_DIR/$S/summary.tsv")"
+            else
+                log_event WARN "$S: PhaVa failed (rc=$rc): $(tail -3 "$PHAVA_DIR/$S.log" | tr '\\\\n' ' ' | cut -c1-400)"
+                STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+            fi
+            rm -f "$PHAVA_DIR/$S.rc"
+        done
+        """
+    )
+    body += textwrap.dedent(
+        f"""
+        # run-level tables: summary, called invertons (linked across samples), all candidates
+        if python3 "$PT" collect --dir "$PHAVA_DIR" --samples {",".join(s.sample for s in samples)} > "$PHAVA_DIR/collect.log" 2>&1; then
+            log_event OK "results: $PHAVA_DIR/<sample>/invertons.tsv; run tables $PHAVA_DIR/summary.tsv, invertons_called.tsv, invertons_all.tsv"
+        else
+            log_event WARN "could not combine the PhaVa tables: $(tail -2 "$PHAVA_DIR/collect.log" | tr '\\\\n' ' ' | cut -c1-300)"
+            STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+        fi
+        """
+    )
+    body += '\nlog_warn_errors_from "$STAGE_LOG"\n'
     write_script(layout.submit_dir / f"{name}.sh", body)
     return name
 
@@ -2887,6 +4255,8 @@ def main():
     p.add_argument("--metrics", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--plots-dir", required=True, type=Path)
+    p.add_argument("--sv-dir", type=Path, default=None,
+                   help="s18b_sv output directory (events.tsv); optional")
     args = p.parse_args()
 
     if not args.metrics.exists():
@@ -3650,6 +5020,75 @@ def main():
                 bin_disp[c] = pd.to_numeric(bin_disp[c], errors="coerce").apply(
                     lambda v: f"{v:.1f}" if pd.notna(v) else "—")
 
+
+    # ---- structural heterogeneity (s18b_sv) ----
+    sv_html = "<p>The structural-heterogeneity stage (s18b_sv) was not run or produced no results.</p>"
+    ev_path = args.sv_dir / "events.tsv" if args.sv_dir else None
+    if ev_path is not None and ev_path.exists():
+        try:
+            ev = pd.read_csv(ev_path, sep="\t", dtype=str).fillna("")
+            if ev.empty:
+                sv_html = "<p>s18b_sv ran but no candidate locus could be placed in any sample.</p>"
+            else:
+                shown = ev[(ev["source"] == "known") | ev["status"].isin(["mixture", "consensus_discrepancy"])].copy()
+                def frac_col(r):
+                    if r.get("method") == "junction":
+                        return f"junction: {r.get('junction_alt_fraction_ci95', '')} ({r.get('junction_call', '')})"
+                    return r.get("allele_reads_fraction_ci95", "")
+                def nreads(r):
+                    # reads behind the call: junction observations when the junctions decided it
+                    if r.get("method") == "junction" and r.get("junction_counts"):
+                        try:
+                            return str(sum(int(x.split("=")[1]) for x in r["junction_counts"].split("; ") if "=" in x))
+                        except ValueError:
+                            pass
+                    return r["spanning_reads"]
+                def cut(v, n=160):
+                    v = str(v)
+                    return v if len(v) <= n else v[:n] + "…"
+                def genes_cell(v):
+                    # complete list; folded when long (the TSV has the same text)
+                    items = [x for x in str(v).split("; ") if x]
+                    if not items:
+                        return "—"
+                    full = escape("; ".join(items))
+                    if len(items) <= 3:
+                        return full
+                    return f"<details><summary>{len(items)} genes</summary>{full}</details>"
+                rows_ = []
+                for _, r in shown.iterrows():
+                    rows_.append({
+                        "sample": escape(r["sample"]), "locus": escape(r["locus"]), "kind": escape(r["kind"]),
+                        "window": escape(f"{r['contig']}:{r['start']}-{r['end']} ({r['consensus_strand']})"),
+                        "segment": escape(r.get("consensus_segment", "")) or "—",
+                        "status": escape(r["status"]), "method": escape(r.get("method", "spanning")),
+                        "reads (spanning or junction)": escape(nreads(r)),
+                        "allele fractions [95% CI]": escape(cut(frac_col(r), 260)),
+                        "floor": escape(r["detection_floor"]), "flags": escape(cut(r["flags"], 80)),
+                        "genes in segment": genes_cell(r["genes_in_consensus_segment"]),
+                        "breakpoint genes": "<br>".join(escape(x) for x in str(r.get("breakpoint_genes", "")).split(" | ") if x) or "—",
+                    })
+                tbl = pd.DataFrame(rows_)
+                counts = ev.groupby(["sample", "status"]).size().unstack(fill_value=0).reset_index()
+                sv_html = (
+                    "<p class='meta'>Each candidate structural variant is re-genotyped against explicit allele "
+                    "sequences: a read counts for an allele only if one alignment spans that allele's whole window "
+                    "(all alleles share one window length), or, for events longer than the reads, at the breakpoint "
+                    "junctions. Fractions are shares of genome copies with Wilson 95% intervals; an allele is called "
+                    "present when its lower bound exceeds the sample's detection floor (highest fake-allele fraction "
+                    "at size-matched null loci, at least sv_min_fraction). <em>segment</em>: the event's variable "
+                    "sequence in this sample's consensus (<code>contig:p^q</code>: the junction where a sequence the "
+                    "consensus lacks joins it); <em>breakpoint genes</em>: the gene at each end of the segment "
+                    "([cut]: the gene extends beyond it) or at the junction, else the nearest gene on each side. "
+                    f"Full per-locus results: <code>{escape(str(ev_path))}</code>.</p>"
+                    "<h3>Known genome versions and reported mixtures</h3>"
+                    + (tbl.to_html(index=False, classes="metrics", border=0, na_rep="—", escape=False)
+                       if not tbl.empty else "<p>No known locus and no supported mixture.</p>")
+                    + "<h3>All candidates by status</h3>" + table_html(counts)
+                )
+        except Exception as e:
+            sv_html = f"<p>SV results could not be read: {escape(str(e))}</p>"
+
     html = (
         "<!doctype html>"
         "<html><head><meta charset='utf-8'><title>Nanopore pipeline report</title>"
@@ -3664,6 +5103,8 @@ def main():
         "detected in the consensus, and any MetaBAT2 bins recovered from "
         "unmapped reads (each with its own classification).</p>"
         f"{sample_cards_html}"
+        "<h2>Structural heterogeneity within samples</h2>"
+        f"{sv_html}"
         "<h2>Plots</h2>"
         f"{''.join(plot_blocks) if plot_blocks else '<p>No plots generated (no data?).</p>'}"
         "<h2>Tabular summary (main assemblies)</h2>"
@@ -3683,7 +5124,470 @@ if __name__ == "__main__":
 
 # ---- s20 generate plots + HTML report ----------------------------------
 
-def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
+REPORT_SMALLVAR_PY = r'''#!/usr/bin/env python3
+"""Adds the consensus-polishing (s12b), small-variant (s18c) and minority-variant
+(s18d) sections to report.html. Called by s20_report after _report.py; only the
+sections of stages that are enabled are added (their directories are passed)."""
+import argparse
+import json
+from html import escape
+from pathlib import Path
+
+import pandas as pd
+
+
+def table(df, max_rows=None):
+    note = ""
+    if max_rows is not None and len(df) > max_rows:
+        note = f"<p class='meta'>Showing the first {max_rows} of {len(df)} rows; the full table is in the file named above.</p>"
+        df = df.head(max_rows)
+    return df.to_html(index=False, classes="metrics", border=0, na_rep="—") + note
+
+
+def read_tsv(p):
+    return pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False)
+
+
+def effect_class(e):
+    return "intergenic" if e.startswith("intergenic") else (e or "unannotated")
+
+
+def count_text(values):
+    c = {}
+    for v in values:
+        c[v] = c.get(v, 0) + 1
+    return ", ".join(f"{k} {n}" for k, n in sorted(c.items(), key=lambda x: (-x[1], x[0])))
+
+
+def snv_gene_table(calls):
+    """One row per comparison and gene; an intergenic call counts for its nearest gene."""
+    rows = []
+    for (cmp_, lt, g, pr), x in calls.groupby(["comparison", "locus_tag", "gene", "product"], sort=False):
+        rows.append({"comparison": cmp_, "locus_tag": lt, "gene": g, "product": pr, "calls": len(x),
+                     "effects": count_text(effect_class(e) for e in x["effect"]),
+                     "protein changes": "; ".join(v for v in x["aa_change"] if v)})
+    t = pd.DataFrame(rows)
+    order = {c: i for i, c in enumerate(dict.fromkeys(calls["comparison"]))}
+    t["_o"] = t["comparison"].map(order)
+    return t.sort_values(["_o", "calls", "locus_tag"], ascending=[True, False, True], kind="stable").drop(columns="_o")
+
+
+def minor_gene_table(x):
+    """One row per sample and gene; an intergenic site counts for its nearest gene."""
+    rows = []
+    for (smp, lt, g, pr), y in x.groupby(["sample", "locus_tag", "gene", "product"], sort=False):
+        rows.append({"sample": smp, "locus_tag": lt, "gene": g, "product": pr, "sites": len(y),
+                     "called": int((y["status"] == "called").sum()), "linked": int((y["status"] == "linked").sum()),
+                     "effects": count_text(effect_class(e) for e in y["effect"]),
+                     "max fraction (%)": f"{100 * max(float(v) for v in y['fraction']):.2f}",
+                     "protein changes": "; ".join(f"{a} ({100 * float(f):.1f}%)"
+                                                  for a, f in zip(y["aa_change"], y["fraction"]) if a)})
+    t = pd.DataFrame(rows)
+    order = {s: i for i, s in enumerate(dict.fromkeys(x["sample"]))}
+    t["_o"] = t["sample"].map(order)
+    return t.sort_values(["_o", "sites", "locus_tag"], ascending=[True, False, True], kind="stable").drop(columns="_o")
+
+
+def group_genes_from_sites(sites):
+    """genes column for groups.tsv files written before it existed (same rule as the engine)."""
+    per = {}
+    for _, r in sites.iterrows():
+        if r["group"] == "-":
+            continue
+        label = (f"{r['locus_tag']}{'(' + r['gene'] + ')' if r['gene'] else ''}:{r['product']}"
+                 if r["locus_tag"] else "unannotated")
+        cnt = per.setdefault(r["group"], {}).setdefault(label, {})
+        cls = effect_class(r["effect"])
+        cnt[cls] = cnt.get(cls, 0) + 1
+    return {gid: " | ".join(f"{lab} [{', '.join(f'{c} x{n}' for c, n in cls.items())}]" for lab, cls in d.items())
+            for gid, d in per.items()}
+
+
+def polish_section(d):
+    d = Path(d)
+    rows, changes = [], []
+    for info in sorted(d.glob("*/info.json")):
+        i = json.loads(info.read_text())
+        rows.append({
+            "sample": i["sample"],
+            "depth (target / used)": f"{i['depth_target']}x / {i['depth_realised']}x",
+            "reads used": f"{int(i['reads_used']):,}",
+            "changes": i["changes"],
+            "by kind": ", ".join(f"{k} {v}" for k, v in sorted(i["change_kinds"].items())) or "none",
+            "dorado filter": ", ".join(f"{k} {v}" for k, v in sorted(i.get("change_filters", {}).items())) or "—",
+            "length draft → polished (bp)": f"{int(i['draft_length']):,} → {int(i['polished_length']):,}",
+            "installed as consensus": "yes" if i.get("installed_sha256") else "no (review mode, or see pipeline.log)",
+        })
+        ct = info.parent / "changes.tsv"
+        if ct.exists():
+            c = read_tsv(ct)
+            if not c.empty:
+                c.insert(0, "sample", i["sample"])
+                changes.append(c)
+    if not rows:
+        return "<p>s12b_polish produced no results (see pipeline.log).</p>"
+    html = ("<p class='meta'>Each Autocycler consensus was polished with <code>dorado polish --bacteria</code> "
+            "on a deterministic read subsample (validation and the choice of depth: README, rule R1). "
+            "Every change is listed with the reads that support the draft (ref) and polished (alt) sequence "
+            "over a window widened to whole homopolymer runs; LowQual is dorado's own low-confidence flag. "
+            f"The drafts are kept in <code>{escape(str(d))}/&lt;sample&gt;/draft.fasta</code>.</p>"
+            + table(pd.DataFrame(rows)))
+    if changes:
+        allc = pd.concat(changes, ignore_index=True)
+        html += "<h3>Changes made by polishing</h3>" + table(allc, 300)
+    else:
+        html += "<p>Polishing changed no base in any sample.</p>"
+    return html
+
+
+def snv_section(d):
+    d = Path(d)
+    cp = d / "comparisons.tsv"
+    if not cp.exists():
+        return "<p>s18c_snv produced no results (see pipeline.log).</p>"
+    comps = read_tsv(cp)
+    show = comps[["comparison", "kind", "sample", "reference", "depth", "n_calls", "n_snp", "n_indel",
+                  "n_mnp_complex", "n_coding_change", "assembly_diffs", "assembly_diffs_without_call",
+                  "calls_not_in_assembly_diff", "identity", "status"]]
+    html = ("<p class='meta'>Reads of each sample mapped to its own consensus (self: residual consensus errors), "
+            "to the consensus of a near-identical sample (cross) and to supplied reference genomes "
+            "(reference). Caller configuration and depth were chosen by validation (README, rule R2). "
+            "<em>assembly_diffs</em> counts small differences between the two assemblies themselves; "
+            "a difference without a read-based call, or a call where the assemblies agree, marks a site "
+            f"to inspect. Files: <code>{escape(str(cp))}</code>, <code>{escape(str(d / 'calls.tsv'))}</code>.</p>"
+            + table(show))
+    calls = read_tsv(d / "calls.tsv") if (d / "calls.tsv").exists() else pd.DataFrame()
+    if calls.empty:
+        html += "<p>No call in any comparison.</p>"
+        return html
+    calls = calls.assign(**{"ALT reads (fwd/rev)": calls["alt_fwd"] + "/" + calls["alt_rev"],
+                            "REF reads (fwd/rev)": calls["ref_fwd"] + "/" + calls["ref_rev"]})
+    cols = ["comparison", "contig", "pos", "ref", "alt", "vtype", "callers", "ALT reads (fwd/rev)",
+            "REF reads (fwd/rev)", "in_repeat", "hp_len", "locus_tag", "gene", "product", "effect", "aa_change",
+            "assembly_diff"]
+    kind = dict(zip(comps["comparison"], comps["kind"]))
+    calls["_k"] = calls["comparison"].map(lambda c: {"cross": 0, "self": 1, "reference": 2}.get(kind.get(c), 3))
+    calls = calls.sort_values(["_k", "comparison"], kind="stable")
+    html += ("<h3>Genes with calls</h3><p class='meta'>One row per comparison and gene (an intergenic call counts "
+             "for the nearest gene, named in its effect).</p>" + table(snv_gene_table(calls), 5000))
+    html += "<h3>Calls (cross-sample and self comparisons first)</h3>" + table(calls[cols], 5000)
+    return html
+
+
+def minor_section(d):
+    d = Path(d)
+    sp = d / "summary.tsv"
+    if not sp.exists():
+        return "<p>s18d_minor produced no results (see pipeline.log).</p>"
+    summ = read_tsv(sp)
+    keep = [c for c in ["sample", "positions_assessed", "positions_masked", "median_depth", "floor_p10",
+                        "floor_median", "floor_p90", "n_called", "n_linked", "n_majority", "n_groups",
+                        "read_fraction_used"] if c in summ.columns]
+    html = ("<p class='meta'>Minority single-nucleotide variants inside each sample from the s13 mapping: "
+            "per-strand counts tested against the sample's own error model per sequence context, "
+            "Benjamini-Hochberg FDR across all positions, strand-bias and context filters, repeats and contig "
+            "ends masked. Fractions are error-corrected with 95% intervals; the detection floor is the "
+            "smallest fraction that would be called at a typical position. Sites carried by the same reads "
+            "form groups (status <em>linked</em>: below the call threshold alone, but on the reads of a group). "
+            "Validation: README, rule R3.</p>" + table(summ[keep]))
+    sites, groups = [], []
+    for s in summ["sample"]:
+        f = d / s / "sites.tsv"
+        if f.exists():
+            x = read_tsv(f)
+            if not x.empty:
+                x.insert(0, "sample", s)
+                sites.append(x)
+        g = d / s / "groups.tsv"
+        if g.exists():
+            y = read_tsv(g)
+            if not y.empty:
+                if "genes" not in y.columns:
+                    y["genes"] = y["group"].map(group_genes_from_sites(read_tsv(f)) if f.exists() else {}).fillna("")
+                y.insert(0, "sample", s)
+                groups.append(y)
+    if sites:
+        x = pd.concat(sites, ignore_index=True)
+        x = x.assign(**{"fraction [95% CI]": x["fraction"] + " [" + x["ci_low"] + "–" + x["ci_high"] + "]",
+                        "ALT reads (fwd/rev)": x["alt_fwd"] + "/" + x["alt_rev"],
+                        "depth (fwd/rev)": x["depth_fwd"] + "/" + x["depth_rev"]})
+        cols = ["sample", "contig", "pos", "ref", "alt", "status", "fraction [95% CI]", "ALT reads (fwd/rev)",
+                "depth (fwd/rev)", "q", "context", "hp_len", "group", "locus_tag", "gene", "product", "effect",
+                "aa_change"]
+        html += ("<h3>Genes with minority variants</h3><p class='meta'>One row per sample and gene (an "
+                 "intergenic site counts for the nearest gene, named in its effect).</p>" + table(minor_gene_table(x), 5000))
+        html += "<h3>Minority sites</h3>" + table(x[[c for c in cols if c in x.columns]], 5000)
+    else:
+        html += "<p>No minority site in any sample.</p>"
+    if groups:
+        gt = pd.concat(groups, ignore_index=True)
+        gcols = [c for c in gt.columns if c not in ("genes", "positions")] + [c for c in ("genes", "positions") if c in gt.columns]
+        html += "<h3>Linked groups</h3>" + table(gt[gcols], 1000)
+    return html
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--report", required=True, type=Path)
+    ap.add_argument("--polish-dir", default="")
+    ap.add_argument("--snv-dir", default="")
+    ap.add_argument("--minor-dir", default="")
+    a = ap.parse_args()
+    html = a.report.read_text()
+    parts = []
+    for title, d, fn in (("Consensus polishing", a.polish_dir, polish_section),
+                         ("Small variants between samples and references", a.snv_dir, snv_section),
+                         ("Minority variants within samples", a.minor_dir, minor_section)):
+        if not d:
+            continue
+        try:
+            sec = fn(d)
+        except Exception as e:  # a broken table must not break the whole report
+            sec = f"<p>Results in {escape(str(d))} could not be read: {escape(str(e))}</p>"
+        parts.append(f"<h2>{escape(title)}</h2>{sec}")
+    block = "".join(parts)
+    for marker in ("<h2>Plots</h2>", "</div></body></html>"):
+        if marker in html:
+            html = html.replace(marker, block + marker, 1)
+            break
+    else:
+        html += block
+    a.report.write_text(html)
+    print(f"added {len(parts)} section(s) to {a.report}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+REPORT_PHAVA_PY = r'''#!/usr/bin/env python3
+"""Adds the phase-variation (s18e_phava, PhaVa) section to report.html. Called by
+s20_report after _report.py (and _report_smallvar.py); written only when s18e_phava
+is enabled. With --minor-dir, the s18d minority-variant groups that overlap a
+candidate inverton are listed (an inverted segment shows up there as a cluster of
+linked mismatches)."""
+import argparse
+from html import escape
+from pathlib import Path
+
+import pandas as pd
+
+
+def table(df, max_rows=None):
+    note = ""
+    if max_rows is not None and len(df) > max_rows:
+        note = f"<p class='meta'>Showing the first {max_rows} of {len(df)} rows; the full table is in the file named above.</p>"
+        df = df.head(max_rows)
+    return df.to_html(index=False, classes="metrics", border=0, na_rep="—") + note
+
+
+def read_tsv(p):
+    return pd.read_csv(p, sep="\t", dtype=str, keep_default_na=False)
+
+
+def pct_ci(r):
+    if r["reverse_fraction"] in ("", "NA"):
+        return "NA"
+    return (f"{100 * float(r['reverse_fraction']):.1f} [{100 * float(r['ci_low']):.1f}–"
+            f"{100 * float(r['ci_high']):.1f}]")
+
+
+def span(r):
+    return f"{r['contig']}:{int(r['start']):,}–{int(r['end']):,}"
+
+
+def phava_joint(r):
+    f, v = int(r["phava_forward_reads"]), int(r["phava_reverse_reads"])
+    return f"{v}/{f + v}" + (f" ({100 * v / (f + v):.1f}%)" if f + v else "")
+
+
+def flank(r, side):
+    g = r[f"{side}_gene"]
+    if not g or g == "NA":
+        return g
+    return f"{g} ({r[side + '_strand']}, {r[side + '_distance']} bp)"
+
+
+def gene_rows(called):
+    """One row per called inverton and gene it may act on: genes overlapping the
+    invertible segment, promoter targets, and for other intergenic invertons the
+    nearest gene on each side."""
+    rows = []
+    for _, r in called.iterrows():
+        rel = []
+        if r["class"] != "NA":
+            for g in r["genes_in_segment"].split("; "):
+                if g:
+                    rel.append((g, "in segment"))
+            targets = [t for t in r["promoter_targets"].split("; ") if t]
+            for t in targets:
+                label, _, rest = t.rpartition(" (")
+                rel.append((label, "promoter target (" + rest))
+            if r["class"] == "intergenic" and not targets:
+                for side in ("left", "right"):
+                    if r[f"{side}_gene"]:
+                        rel.append((r[f"{side}_gene"], f"{side} flank ({r[side + '_strand']}, "
+                                    f"{r[side + '_distance']} bp)"))
+        for g, how in rel:
+            rows.append({"sample": r["sample"], "gene": g, "relation": how, "inverton": span(r),
+                         "class": r["class"], "inverted % [95% CI]": pct_ci(r),
+                         "in other samples": r.get("in_other_samples", "")})
+    return pd.DataFrame(rows, columns=["sample", "gene", "relation", "inverton", "class", "inverted % [95% CI]",
+                                       "in other samples"])
+
+
+def minority_overlaps(allc, minor_dir, samples):
+    """Every s18d group with the candidate inverton (same sample) that holds most of its sites
+    (ties: called first, then the higher inverted fraction, then the leftmost); reads carrying
+    an inverted segment differ from the consensus at many linked positions inside it."""
+    rank = {"called": 0, "below_filter": 1, "no_reverse_reads": 2, "not_spanned": 3}
+    rows = []
+    for s in samples:
+        g = Path(minor_dir) / s / "groups.tsv"
+        if not g.exists():
+            continue
+        cand = allc[allc["sample"] == s]
+        for _, x in read_tsv(g).iterrows():
+            pos = [int(p) for p in x["positions"].split(",") if p]
+            gs, ge = int(x["start"]), int(x["end"])
+            best = None
+            for _, r in cand[(cand["contig"] == x["contig"]) & (cand["start"].astype(int) <= ge)
+                             & (cand["end"].astype(int) >= gs)].iterrows():
+                k = sum(int(r["start"]) <= p <= int(r["end"]) for p in pos)
+                fr = float(r["reverse_fraction"]) if r["reverse_fraction"] != "NA" else -1.0
+                key = (-k, rank[r["status"]], -fr, int(r["start"]))
+                if best is None or key < best[0]:
+                    best = (key, k, r)
+            row = {"sample": s, "minority group": x["group"], "group span": f"{x['contig']}:{gs:,}–{ge:,}",
+                   "sites": x["n_sites"], "group fraction %": f"{100 * float(x['fraction']):.1f}"}
+            if best is None:
+                row.update({"sites inside inverton": f"0/{len(pos)}", "inverton": "", "status": "",
+                            "inverted % [95% CI]": "", "PhaVa joint inverted/counted": ""})
+            else:
+                r = best[2]
+                row.update({"sites inside inverton": f"{best[1]}/{len(pos)}", "inverton": span(r), "status": r["status"],
+                            "inverted % [95% CI]": pct_ci(r), "PhaVa joint inverted/counted": phava_joint(r)})
+            row["genes"] = x["genes"] if "genes" in x else ""
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def phava_section(d, minor_dir=""):
+    d = Path(d)
+    sp = d / "summary.tsv"
+    if not sp.exists():
+        return "<p>s18e_phava produced no results (see pipeline.log).</p>"
+    summ = read_tsv(sp)
+    if summ.empty:
+        return "<p>s18e_phava produced no results (see pipeline.log).</p>"
+    s0 = summ.iloc[0]
+    html = ("<p class='meta'>Invertible DNA segments (invertons) between inverted repeats, found in each consensus by "
+            f"PhaVa {escape(s0['phava_version'])} (einverted; segments of at least 30 bp) and quantified from reads "
+            "that span the whole inverton in one orientation (MAPQ above 2, at most 15% mismatches). PhaVa maps the "
+            "reads to all candidates at once and then loses reference-orientation reads where candidates are close, "
+            "which inflates the inverted fraction; every candidate with an inverted read is therefore re-counted "
+            "against its own two orientations only (same reads and rules; PhaVa's joint counts are shown alongside). "
+            "Reads were subsampled by read name where deeper than the cap (column depth used). An inverton is <em>called</em> "
+            f"when at least {escape(s0['min_reverse_reads'])} reads carry the inverted orientation and they are at "
+            f"least {100 * float(s0['min_reverse_fraction']):g}% of the counted reads; fractions with Wilson 95% "
+            "intervals. Class is the segment against the CDS (intragenic, gene boundary, intergenic); promoter "
+            "targets are flanking genes whose 5′ end faces an intergenic inverton within 300 bp. Full tables: "
+            f"{escape(str(d))}/&lt;sample&gt;/invertons.tsv (all candidates), invertons_called.tsv. "
+            "Validation: README, rule R4.</p>")
+    st = summ.rename(columns={"candidates": "candidate invertons", "spanned": "spanned by reads",
+                              "with_reverse_reads": "with inverted reads", "regenotyped": "re-counted",
+                              "phava_called": "PhaVa joint counts would call", "called_intergenic": "intergenic",
+                              "called_gene_boundary": "gene boundary", "called_intragenic": "intragenic",
+                              "called_with_promoter_target": "with promoter target",
+                              "median_counted_reads": "median counted reads", "depth_used": "depth used (x)"})
+    html += table(st[["sample", "candidate invertons", "spanned by reads", "with inverted reads", "re-counted",
+                      "PhaVa joint counts would call", "called",
+                      "intergenic", "gene boundary", "intragenic", "with promoter target", "median counted reads",
+                      "depth used (x)"]])
+    cp = d / "invertons_called.tsv"
+    called = read_tsv(cp) if cp.exists() else pd.DataFrame()
+    if called.empty:
+        html += "<p>No inverton is called in any sample.</p>"
+    else:
+        ct = pd.DataFrame({"sample": called["sample"], "inverton": called.apply(span, axis=1),
+                           "segment (bp)": called["segment_bp"], "repeat (bp)": called["ir_bp"],
+                           "inverted/counted reads": called["reverse_reads"] + "/" + called["counted_reads"],
+                           "inverted % [95% CI]": called.apply(pct_ci, axis=1),
+                           "PhaVa joint inverted/counted": called.apply(phava_joint, axis=1), "class": called["class"],
+                           "genes in segment": called["genes_in_segment"], "breakpoint genes": called["breakpoint_genes"],
+                           "promoter targets": called["promoter_targets"],
+                           "left gene": called.apply(lambda r: flank(r, "left"), axis=1),
+                           "right gene": called.apply(lambda r: flank(r, "right"), axis=1),
+                           "in other samples": called["in_other_samples"]})
+        html += ("<h3>Genes at called invertons</h3><p class='meta'>One row per called inverton and gene: genes "
+                 "overlapping the invertible segment, promoter targets, and for other intergenic invertons the nearest "
+                 "gene on each side.</p>" + table(gene_rows(called), 5000))
+        html += "<h3>Called invertons</h3>" + table(ct, 5000)
+    ap = d / "invertons_all.tsv"
+    allc = read_tsv(ap) if ap.exists() else pd.DataFrame()
+    below = allc[allc["status"] == "below_filter"] if not allc.empty else allc
+    if not below.empty:
+        bt = pd.DataFrame({"sample": below["sample"], "inverton": below.apply(span, axis=1),
+                           "segment (bp)": below["segment_bp"],
+                           "inverted/counted reads": below["reverse_reads"] + "/" + below["counted_reads"],
+                           "inverted % [95% CI]": below.apply(pct_ci, axis=1),
+                           "PhaVa joint inverted/counted": below.apply(phava_joint, axis=1), "class": below["class"],
+                           "genes in segment": below["genes_in_segment"],
+                           "left gene": below.apply(lambda r: flank(r, "left"), axis=1),
+                           "right gene": below.apply(lambda r: flank(r, "right"), axis=1)})
+        html += ("<h3>Inverted reads below the call threshold</h3><p class='meta'>Candidates with inverted reads "
+                 "that do not reach the call thresholds (fewer reads or a lower fraction).</p>" + table(bt, 1000))
+    if minor_dir and not allc.empty:
+        ov = minority_overlaps(allc, minor_dir, list(summ["sample"]))
+        if not ov.empty:
+            k = ov["sites inside inverton"].map(lambda v: [int(t) for t in v.split("/")])
+            half = k.map(lambda v: v[1] > 0 and 2 * v[0] >= v[1])
+            n_half = int(half.sum())
+            n_called = int((half & (ov["status"] == "called")).sum())
+            html += ("<h3>Minority-variant groups and candidate invertons</h3><p class='meta'>Every s18d minority group "
+                     "with the candidate inverton holding most of its sites. "
+                     f"{n_half} of {len(ov)} groups have at least half of their sites inside a candidate inverton "
+                     f"({n_called} inside a called one). Reads carrying an inverted segment differ from the consensus "
+                     "at many linked positions inside it, so such a group may be an inversion rather than point "
+                     "mutations. A group inside a candidate without inverted reads is not explained by that "
+                     "candidate.</p>" + table(ov, 1000))
+    return html
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--report", required=True, type=Path)
+    ap.add_argument("--phava-dir", required=True)
+    ap.add_argument("--minor-dir", default="")
+    a = ap.parse_args()
+    html = a.report.read_text()
+    try:
+        sec = phava_section(a.phava_dir, a.minor_dir)
+    except Exception as e:  # a broken table must not break the whole report
+        sec = f"<p>Results in {escape(str(a.phava_dir))} could not be read: {escape(str(e))}</p>"
+    block = f"<h2>Phase variation</h2>{sec}"
+    for marker in ("<h2>Plots</h2>", "</div></body></html>"):
+        if marker in html:
+            html = html.replace(marker, block + marker, 1)
+            break
+    else:
+        html += block
+    a.report.write_text(html)
+    print(f"added the phase variation section to {a.report}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def stage_report(cfg: dict, layout: Layout, hold: str, smallvar: dict | None = None,
+                 phava: dict | None = None) -> str:
+    """smallvar: {"polish": dir, "snv": dir, "minor": dir} for the enabled s12b/s18c/s18d
+    stages; their sections are added to report.html by _report_smallvar.py.
+    phava: {"phava": dir, "minor": dir or ""} when s18e is enabled; its section is
+    added by _report_phava.py."""
     name = "s20_report"
     body = sge_header(
         name, layout.stdout_dir, cfg["sge_h_rt_cpu"], cfg["sge_h_vmem_cpu"],
@@ -3705,7 +5609,8 @@ def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
         python3 {py_path} \\
             --metrics {layout.reports}/metrics.tsv \\
             --out {layout.reports}/report.html \\
-            --plots-dir {layout.reports}/plots
+            --plots-dir {layout.reports}/plots \\
+            --sv-dir {layout.sv}
         rc=$?
         set -e
         if [ $rc -ne 0 ]; then
@@ -3714,7 +5619,7 @@ def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
         else
             log_event OK "report written to {layout.reports}/report.html"
         fi
-
+        {{SMALLVAR_BLOCK}}
         log_warn_errors_from "$STAGE_LOG"
 
         log_event SUMMARY "pipeline finished — log at $PIPELINE_LOG, summary at {layout.root}/pipeline_summary.txt, report at {layout.reports}/report.html"
@@ -3726,6 +5631,45 @@ def stage_report(cfg: dict, layout: Layout, hold: str) -> str:
         cat "{layout.root}/pipeline_summary.txt"
         """
     ).strip() + "\n"
+    block = ""
+    if smallvar:
+        sv_py = layout.submit_dir / "_report_smallvar.py"
+        sv_py.write_text(REPORT_SMALLVAR_PY)
+        sv_py.chmod(sv_py.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        args = " ".join(f"--{k}-dir {v}" for k, v in smallvar.items())
+        block = textwrap.dedent(
+            f"""
+            if [ $rc -eq 0 ]; then
+                if python3 {sv_py} --report {layout.reports}/report.html {args}; then
+                    log_event OK "added {', '.join(smallvar)} sections to the report"
+                else
+                    log_event WARN "could not add the {', '.join(smallvar)} sections to the report"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                fi
+            fi
+            """
+        ).strip()
+        block = "\n" + block + "\n"
+    if phava:
+        ph_py = layout.submit_dir / "_report_phava.py"
+        ph_py.write_text(REPORT_PHAVA_PY)
+        ph_py.chmod(ph_py.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        args = f"--phava-dir {phava['phava']}" + (f" --minor-dir {phava['minor']}" if phava.get("minor") else "")
+        pblock = textwrap.dedent(
+            f"""
+            if [ $rc -eq 0 ]; then
+                if python3 {ph_py} --report {layout.reports}/report.html {args}; then
+                    log_event OK "added the phase variation section to the report"
+                else
+                    log_event WARN "could not add the phase variation section to the report"
+                    STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
+                fi
+            fi
+            """
+        ).strip()
+        block = (block or "\n") + pblock + "\n"
+    # Without the new stages the script is byte-identical to earlier versions.
+    body = body.replace("{SMALLVAR_BLOCK}", block)
     write_script(layout.submit_dir / f"{name}.sh", body)
     return name
 
@@ -3736,6 +5680,14 @@ def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
     """Run MIJAMP's preprocess script per sample using the methylation-tagged
     BAM from s02b_demux_bam and the corresponding Bakta-annotated .fna from
     s16_annotate. MIJAMP is expected to be git-cloned at cfg['mijamp_dir'].
+
+    Each BAM is first downsampled to cfg['mijamp_target_depth'] (default
+    100x; 0 = all reads), and cfg['mijamp_filter_threshold'] (default 0.9)
+    is passed to modkit. MIJAMP's motif step keeps only sites that are
+    >= 90% modified with Ndiff == 0 (no reads showing another base) and
+    needs more than 100 of them. Those filters were set for ~100x data: at
+    several hundred x nearly every site fails on Ndiff, and with MIJAMP's
+    default threshold of 0.6 many fully methylated 6mA sites stay below 90%.
     """
     name = "s21_mijamp"
     body = sge_header(
@@ -3746,6 +5698,12 @@ def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
     body += log_setup(name, layout) + "\n\n"
     threads = int(cfg.get("mijamp_threads", 20))
     mij_dir = cfg.get("mijamp_dir", "") or ""
+    target_depth = int(float(cfg.get("mijamp_target_depth", 100) or 0))
+    filter_thr = float(cfg.get("mijamp_filter_threshold", 0.9))
+    if target_depth < 0 or not 0 < filter_thr <= 1:
+        raise SystemExit(
+            "pipeline_config.yaml: mijamp_target_depth must be >= 0 and "
+            f"mijamp_filter_threshold in (0, 1] (got {target_depth}, {filter_thr})")
     body += textwrap.dedent(
         f"""
         MIJAMP_DIR="{mij_dir}"
@@ -3809,16 +5767,44 @@ def stage_mijamp(cfg: dict, layout: Layout, samples: List[Sample], hold: str) ->
                     log_event WARN "{s.sample}: dir listing was: $(ls -l {layout.annotate}/{s.sample}/ 2>&1 | tr '\\n' ' ' | cut -c1-300)"
                     STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
                 else
-                    log_event OK "{s.sample}: MIJAMP preprocess (bam=$bam_file, genome=$genome [$gsrc])"
+                    # MIJAMP motif's site filters are absolute read counts tuned on ~100x
+                    # data (a site needs Ndiff == 0: no reads showing another base). At
+                    # several hundred x and above nearly every site has a few error reads,
+                    # so motif finds no motifs. Downsample to mijamp_target_depth first.
+                    mij_bam="$bam_file"
+                    sub_bam="{layout.mijamp}/{s.sample}.downsampled.tmp.bam"
+                    rm -f "$sub_bam"
+                    if [ {target_depth} -gt 0 ]; then
+                        glen=$(awk '!/^>/ {{ n += length($0) }} END {{ print n + 0 }}' "$genome")
+                        bases=$(samtools view -@ {threads} "$bam_file" | awk -F'\\t' '{{ n += length($10) }} END {{ print n + 0 }}')
+                        depth=$(awk -v b="$bases" -v g="$glen" 'BEGIN {{ printf "%.0f", (g > 0 ? b / g : 0) }}')
+                        sarg=$(awk -v b="$bases" -v g="$glen" -v t={target_depth} 'BEGIN {{ if (b <= 0 || g <= 0 || t * g >= b) exit; p = int(1000000 * t * g / b + 0.5); if (p < 1) p = 1; printf "42.%06d", p }}')
+                        if [ "$bases" -le 0 ]; then
+                            log_event WARN "{s.sample}: could not count bases in $bam_file — not downsampling"
+                        elif [ -n "$sarg" ]; then
+                            log_event OK "{s.sample}: read depth ${{depth}}x, downsampling to ~{target_depth}x for MIJAMP (samtools view -s $sarg)"
+                            if samtools view -@ {threads} -b -s "$sarg" -o "$sub_bam" "$bam_file"; then
+                                mij_bam="$sub_bam"
+                            else
+                                log_event WARN "{s.sample}: downsampling failed — using the full-depth BAM"
+                                rm -f "$sub_bam"
+                            fi
+                        else
+                            log_event OK "{s.sample}: read depth ${{depth}}x <= {target_depth}x, not downsampling"
+                        fi
+                    fi
+                    log_event OK "{s.sample}: MIJAMP preprocess (bam=$mij_bam, genome=$genome [$gsrc], modkit filter threshold {filter_thr})"
                     mkdir -p {out_dir}
                     set +e
                     "$MIJAMP_DIR/scripts/preprocess" \\
-                        -b "$bam_file" \\
+                        -b "$mij_bam" \\
                         -g "$genome" \\
                         -t {threads} \\
+                        -y {filter_thr} \\
                         -o {out_dir}
                     rc=$?
                     set -e
+                    rm -f "$sub_bam"
                     if [ $rc -ne 0 ]; then
                         log_event WARN "{s.sample}: MIJAMP rc=$rc"
                         STAGE_FAIL_COUNT=$((STAGE_FAIL_COUNT+1))
@@ -3981,7 +5967,7 @@ def main() -> None:
         layout.assemblies_fasta, layout.cluster_dir, layout.consensus,
         layout.annotate, layout.bams, layout.mapping, layout.meta_flye,
         layout.bins, layout.checkm2, layout.gtdbtk, layout.reports,
-        layout.mijamp,
+        layout.mijamp, layout.sv,
     ]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -3996,12 +5982,24 @@ def main() -> None:
         for s in samples:
             fh.write(f"{s.sample}\t{s.genus}\t{s.species}\t{s.strain}\t{s.kingdom}\n")
 
-    n01 = stage_basecall(cfg, layout)
-    n02 = stage_demux(cfg, layout, hold=n01)
+    split_jobs = basecall_split_jobs(cfg)
+    if split_jobs > 1:
+        # Split basecalling: one GPU array task per chunk of pod5 files, then a
+        # CPU job checks the chunk BAMs and concatenates them into basecalls.bam.
+        chunks, n_kept = plan_basecall_chunks(
+            layout.pod5_dir, split_jobs, layout.submit_dir / "s01_basecall_chunks.tsv")
+        n01 = stage_basecall_split(cfg, layout, chunks)
+        n01b = stage_merge_basecalls(cfg, layout, chunks, hold=n01)
+        report_basecall_plan(cfg, chunks, split_jobs, n_kept)
+    else:
+        n01 = stage_basecall(cfg, layout)
+        n01b = None
+    n_bam = n01b or n01
+    n02 = stage_demux(cfg, layout, hold=n_bam)
     # Parallel branch: dorado demux to BAM (preserves MM/ML methylation tags).
-    # Runs in parallel with s02_demux off the same s01_basecall output, then
+    # Runs in parallel with s02_demux off the same basecalls.bam, then
     # feeds s21_mijamp at the end.
-    n02b = stage_demux_bam(cfg, layout, hold=n01)
+    n02b = stage_demux_bam(cfg, layout, hold=n_bam)
     n03 = stage_rename(cfg, layout, samples, hold=n02)
     n04 = stage_filter(cfg, layout, samples, hold=n03)
     n05 = stage_subsample(cfg, layout, samples, hold=n04)
@@ -4013,10 +6011,12 @@ def main() -> None:
     n10 = stage_trim_resolve(cfg, layout, hold=n09)
     n11 = stage_combine(cfg, layout, samples, hold=n10)
     n12 = stage_collect(cfg, layout, samples, hold=n11)
+    # Optional polishing of each consensus before anything maps to or annotates it.
+    n12b = stage_polish(cfg, layout, samples, hold=n12)
     # Mapping → meta-assembly → binning happen BEFORE Bakta now, so Bakta
     # can annotate both the autocycler consensuses AND the metabat2 bins in
     # a single stage.
-    n13 = stage_map_reads(cfg, layout, samples, hold=n12)
+    n13 = stage_map_reads(cfg, layout, samples, hold=n12b or n12)
     n14 = stage_meta_assemble(cfg, layout, samples, hold=n13)
     n15 = stage_bin(cfg, layout, samples, hold=n14)
     # GTDB-Tk and CheckM2 both take the raw assemblies (consensuses + bins)
@@ -4027,18 +6027,36 @@ def main() -> None:
     # picks BOTH the annotator (Bacteria->Bakta, Archaea->Prokka) and the
     # RefSeq type-strain proteome passed to --proteins.
     n18 = stage_annotate(cfg, layout, samples, hold=n16)
+    # Structural heterogeneity needs the s13 read mappings and the annotation
+    # (for genes in variable segments); s19/s20 wait for it so the report has it.
+    n18b = stage_sv(cfg, layout, samples, hold=f"{n13},{n18}")
+    # Optional small-variant stages: between samples / references, and minority
+    # variants within samples. Both need the s13 mapping and the annotation.
+    n18c = stage_snv(cfg, layout, samples, hold=f"{n13},{n18}")
+    n18d = stage_minor(cfg, layout, samples, hold=f"{n13},{n18}")
+    # Phase variation (PhaVa) maps the filtered reads itself; it needs the
+    # consensus, the annotation (gene context) and the s13 mapping (re-count).
+    n18e = stage_phava(cfg, layout, samples, hold=f"{n13},{n18}")
     # Aggregate reads annotation features + CheckM2 quality + GTDB-Tk taxonomy.
-    n19 = stage_aggregate(cfg, layout, samples, hold=f"{n17},{n18}")
-    n20 = stage_report(cfg, layout, hold=n19)
+    n19 = stage_aggregate(cfg, layout, samples, hold=",".join([n17, n18, n18b] + [x for x in (n18c, n18d, n18e) if x]))
+    smallvar = {k: str(layout.root / d) for k, d, n in (("polish", "polish", n12b), ("snv", "snv", n18c),
+                                                       ("minor", "minor", n18d)) if n}
+    phava = {"phava": str(layout.root / "phava"), "minor": str(layout.root / "minor") if n18d else ""} if n18e else None
+    n20 = stage_report(cfg, layout, hold=n19, smallvar=smallvar or None, phava=phava)
     # MIJAMP needs both the demux BAMs (s02b) and the Bakta .fna (s16, which
     # is upstream of s20). Hold on both so SGE waits for the slower of the two.
     n21 = stage_mijamp(cfg, layout, samples, hold=f"{n20},{n02b}")
 
     ordered = [
-        [n01], [n02], [n02b], [n03], [n04], [n05],
+        [n01],
+    ] + ([[n01b]] if n01b else []) + [
+        [n02], [n02b], [n03], [n04], [n05],
         n06_list,
         [n07], [n08], [n09], [n10], [n11], [n12],
-        [n13], [n14], [n15], [n16], [n17], [n18], [n19], [n20], [n21],
+    ] + ([[n12b]] if n12b else []) + [
+        [n13], [n14], [n15], [n16], [n17], [n18], [n18b],
+    ] + [[n] for n in (n18c, n18d, n18e) if n] + [
+        [n19], [n20], [n21],
     ]
     write_submit_all(layout, ordered)
     write_pipeline_status(layout)

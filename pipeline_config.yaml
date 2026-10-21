@@ -21,7 +21,7 @@ kit_name: SQK-NBD114-24
 # Remember to delete fastq_raw/, bams/ and everything downstream first, or the
 # resume guards will skip the demux stages entirely.
 demux_reclassify: false
-demux_kit_name: "SQK-NBD114-24"        # defaults to kit_name above when left empty
+demux_kit_name: "SQK-RBK114-24"        # defaults to kit_name above when left empty
 
 # ---------- CUDA (used during basecall + demux) ----------
 cuda_dir: /ebio/abt3_projects/software
@@ -139,6 +139,179 @@ checkm2_tmpdir: ""
 #   git clone https://code.ornl.gov/alexander-public/mijamp.git /path/to/mijamp
 mijamp_dir: "/ebio/abt3_scratch/jmarsh/software/mijamp"
 mijamp_threads: 20
+# MIJAMP's motif step keeps only sites that are >= 90% modified with no
+# reads showing a different base (Ndiff == 0) and needs > 100 of them. Those
+# filters were set for ~100x data; at several hundred x nearly every site has
+# a few error reads and motif finds nothing. s21 therefore downsamples each
+# sample's BAM to this read depth before preprocessing (0 = use all reads).
+mijamp_target_depth: 100
+# modkit --filter-threshold passed to MIJAMP preprocess (-y). MIJAMP's own
+# default, 0.6, leaves many fully methylated 6mA sites below motif's 90%
+# cut-off; 0.9 is close to modkit's automatically estimated thresholds.
+mijamp_filter_threshold: 0.9
+
+# ---------- Structural heterogeneity (s18b_sv) ----------
+# Finds and quantifies two or more versions of the same genome inside one
+# sample: e.g. a strain and its deletion mutant, a subpopulation with an
+# inverted or duplicated segment, an amplified or excised element. Each
+# candidate is re-genotyped against explicit allele sequences with reads that
+# span the whole allele window (or, for events longer than the reads, at its
+# breakpoint junctions), and reported as the fraction of genome copies carrying
+# each version with a 95% interval. See README "Structural heterogeneity".
+sv_enabled: true
+# Env needs python>=3.9, mappy, pysam, sniffles>=2.2 and samtools, e.g.
+#   mamba create -n sv -c conda-forge -c bioconda python=3.12 sniffles mappy pysam samtools
+conda_env_sv: sv
+# Genome versions you expect in the samples, one single-sequence FASTA each;
+# the first is the base. Their differences become known loci, genotyped in
+# every sample whose consensus contains their flanks. Leave empty to rely on
+# discovery alone.
+sv_variant_genomes: []
+#  - /path/to/strain.fasta
+#  - /path/to/strain_deletion_mutant.fasta
+# Sniffles2 (mosaic mode) on each sample's s13 mapping finds candidates that
+# were not supplied; every candidate is then re-genotyped as above.
+sv_discovery: true
+# auto: events too long for spanning reads are genotyped at their breakpoint
+# junctions; always: both methods for every locus; never: spanning reads only.
+sv_junction_mode: auto
+# Loci whose allele windows are longer than this (bp) are genotyped primarily
+# at their junctions: few reads span such windows, too few to see minor versions.
+sv_max_span_window: 20000
+sv_min_len: 500          # smallest event considered (bp)
+# Unique sequence required beyond each end of an allele window (bp). For
+# knock-out / allelic-exchange experiments, reads from a plasmid carrying the
+# homology arms contain the deletion junction; reads are only counted when they
+# stay collinear with the genome beyond the window, but setting this larger than
+# the arms (e.g. arm length + 500) adds a second safeguard.
+sv_anchor: 1000
+sv_min_alt_reads: 5      # reads needed before an allele can be called present
+# Lowest detection floor (fraction of genome copies). The per-sample floor is
+# the highest fake-allele fraction at size-matched null loci, never below this.
+# Barcode cross-talk between multiplexed samples is typically 0.1-1%.
+sv_min_fraction: 0.01
+sv_min_spanning: 20      # fewer counted reads -> insufficient_spanning_reads
+sv_null_loci: 20         # fake events per size class for the empirical floor
+sv_max_reads: 3000       # reads used per locus (deterministic subsample above this)
+sv_threads: 8
+sge_h_vmem_sv: "4G"      # per slot
+
+# ---------- Consensus polishing (s12b_polish) ----------
+# dorado polish --bacteria on each Autocycler consensus, after s12_collect and
+# before mapping and annotation. The draft is kept in polish/<sample>/draft.fasta
+# with a table of every change. Defaults follow validation rule R1 (README
+# "Consensus polishing").
+polish_enabled: false
+polish_depth: 100        # fold coverage of the deterministic read subsample
+polish_device: cpu        # cpu, or cuda:all on a GPU node (CPU: 2-5 min per 3-Mb genome at 100x, 16 threads)
+polish_threads: 16
+polish_models_dir: ""     # folder with the dorado polishing models; empty = the folder holding basecall_model
+# Refuse a polished genome whose length differs from the draft by more than this fraction.
+polish_max_length_change: 0.001
+# false = review mode: write the polished genome and change table for inspection
+# but keep the Autocycler consensus for everything downstream.
+polish_install: true
+# A consensus already used downstream (s13 mapping or annotation exist) is never
+# replaced unless this is true; move those outputs aside instead (README).
+polish_replace_existing: false
+sge_h_vmem_polish: "6G"   # per slot
+# Env shared by s12b_polish, s18c_snv and s18d_minor: python>=3.9, mappy, pysam,
+# numpy, scipy, minimap2, samtools, bcftools, e.g.
+#   mamba create -n snv -c conda-forge -c bioconda python=3.12 mappy pysam numpy scipy minimap2 samtools bcftools
+conda_env_snv: snv
+
+# ---------- Small variants between samples and references (s18c_snv) ----------
+# Reads of each sample mapped to (self) its own consensus, (cross) the consensus
+# of a near-identical sample in this run and (reference) each genome in
+# snv_references that is close enough; SNPs and indels with read support, gene
+# effect and a check against the assembly-level differences. Caller and depth
+# follow validation rule R2 (README "Small variants between samples").
+snv_enabled: true
+snv_caller: INT         # C3P = Clair3 --haploid_precise; C3AF, DP, INT, UNI: see README
+snv_depth: 25           # fold coverage of the read subsample per comparison
+snv_self: true
+snv_cross: true
+# Samples whose consensus genomes are at least this identical (small differences
+# only) over at least this fraction of both genomes are compared with each other.
+snv_cross_min_identity: 0.999
+snv_cross_min_aligned: 0.9
+# External genomes: FASTA paths, or {fasta: ..., gff: ..., name: ...}. Without a
+# GFF, the sample's own annotation is lifted over. Each reference is used for the
+# samples whose consensus matches it at these thresholds.
+snv_references: []
+#  - /path/to/reference_strain.fasta
+#  - {fasta: /path/to/other.fasta, gff: /path/to/other.gff3, name: other}
+snv_ref_min_identity: 0.99
+snv_ref_min_aligned: 0.8
+snv_clair3_min_af: 0.65   # C3AF/INT/UNI only: Clair3 het calls become haploid ALT at this allele fraction
+# Clair3 >= 2.0 (PyTorch) in its own env, and its R10.4.1 sup v5.2.0 model
+# (converted Rerio model r1041_e82_400bps_sup_v520; README).
+conda_env_clair3: clair3  # env name or absolute prefix
+snv_clair3_model: /tmp/global2/jmarsh/code/conda_envs/clair3_models/r1041_e82_400bps_sup_v520
+snv_threads: 16
+sge_h_vmem_snv: "6G"      # per slot
+
+# ---------- Minority variants within samples (s18d_minor) ----------
+# Minority SNVs in each sample's s13 mapping, tested against the sample's own
+# error model per sequence context; error-corrected fractions with 95 %
+# intervals, linked into groups when carried by the same reads. Thresholds are
+# the ones validated under rule R3 (README "Minority variants").
+minor_enabled: true
+minor_fdr: 0.01           # Benjamini-Hochberg over all positions and alternative bases
+minor_min_alt_per_strand: 3
+minor_min_strand_depth: 20
+minor_min_baseq: 10
+minor_min_mapq: 20
+minor_end_mask: 500       # bp masked at linear contig ends
+# The engine was validated at 100-2,000x; deeper samples are read-subsampled
+# (deterministically) to this mean depth. 0 = use all reads.
+minor_max_depth: 2000
+minor_parallel: 4         # samples analysed at the same time (one SGE slot each)
+sge_h_vmem_minor: "8G"    # per slot
+
+# ---------- Phase variation (s18e_phava) ----------
+# Invertible DNA segments between inverted repeats (invertons), found in each
+# consensus and quantified from the filtered reads with PhaVa 0.2.3 (Chanin et
+# al. 2024, Nature 634: 234-242); gene-annotated tables and a report section. The thresholds
+# are PhaVa's recommended filter, validated under rule R4 (README "Phase
+# variation"). The env needs phava 0.2.3 from bioconda (einverted, minimap2).
+phava_enabled: true
+conda_env_phava: phava
+# Deeper samples are read-subsampled (deterministically, by read name) to this
+# mean depth: PhaVa's alignment file and run time grow with depth. 0 = all reads.
+phava_max_depth: 1000
+phava_min_reverse_reads: 3        # reads in the inverted orientation
+phava_min_reverse_fraction: 0.03  # inverted / counted reads at the inverton
+phava_threads: 4          # per sample
+phava_parallel: 4         # samples analysed at the same time
+sge_h_vmem_phava: "4G"    # per slot
+
+# ---------- Split basecalling across GPU nodes (s01_basecall + s01b_merge_bam) ----------
+# dorado cannot spread one job across nodes. With basecall_split_jobs > 1 the pod5
+# files are divided into that many chunks of similar size when the pipeline is
+# generated (plan: submit_scripts/s01_basecall_chunks.tsv), s01_basecall becomes an
+# SGE array with one GPU job per chunk (the gpu complex is 1 per host here, so each
+# job runs on its own node), and s01b_merge_bam concatenates the chunk BAMs into
+# basecalled/basecalls.bam before demux. 1 = one job over the whole folder, which is
+# also what an older config without this key gets. If pod5 files appear after the
+# pipeline was generated, s01b stops rather than merge without them; re-running
+# generate_pipeline.py keeps the finished chunks and adds chunks for the new files.
+# 32 chunks of a ~450 GB run (12-18 GB each) take up to ~6 h on the slowest cards here
+# (TITAN Xp) and under 1 h on the 24 GB ones; more chunks than free GPU nodes is fine, they queue.
+basecall_split_jobs: 32
+# Resources of each split job; they replace sge_gpumem, sge_h_rt_gpu, sge_pe_parallel
+# and sge_h_vmem_gpu for these jobs only (an empty value falls back to those keys).
+# 12G admits the 12 GB cards as well as the 24 GB and 80 GB ones, h_rt <= 24 h admits
+# standard.q as well as long.q, and 4 slots fit the 12 GB nodes, which rarely have more
+# free (dorado keeps ~4.5 cores busy). h_vmem must stay large: SGE enforces it as an
+# address-space limit, and dorado's CUDA start-up fails at 4 x 10G although the job then
+# uses at most ~26 GB (README, "Split basecalling").
+basecall_split_gpumem: "12G"
+basecall_split_h_rt: "24:0:0"
+basecall_split_slots: 4
+basecall_split_h_vmem: "80G"         # per slot
+basecall_split_keep_chunks: false    # true keeps basecalled/chunks/chunk_*.bam after the merge
+sge_h_vmem_merge_bam: "4G"           # per slot (s01b_merge_bam uses 4 slots)
 
 # ---------- SGE ----------
 email: james.marsh@tuebingen.mpg.de

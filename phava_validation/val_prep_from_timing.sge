@@ -1,0 +1,35 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_vmem=4G
+# usage: qsub val_prep_from_timing.sge SAMPLE GFF_EXT DEPTH
+# Rule R4 control = the timing run at the validated cap (same seeded subsample, consensus, GFF and
+# PhaVa variation_wf --reportAll); its reads and ratio table are moved here, then re-annotated,
+# the spiked invertons drawn and the edited read sets written.
+. ~/.bashrc
+mamba activate phava
+set -euo pipefail
+# numpy/OpenBLAS would reserve buffers for every core of the node and break h_vmem
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+S=$1; EXT=$2; DEPTH=$3
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+PW=/ebio/abt3_scratch/jmarsh/software/science/phava_build
+T=$PW/phava_tools.py; SP=$PW/spike_inv.py
+TW=$PW/timing/$S.d$DEPTH
+V=$PW/val/$S
+[ -s $TW/phava/reads.fastq_vs_$S.fasta_ratio.tsv ] || { echo "no timing control at $TW"; exit 2; }
+python3 -c "import json,sys; d=json.load(open('$TW/subsample.json')); sys.exit(0 if d['max_depth']==$DEPTH and d['seed']=='phava1' else 1)"
+rm -rf "$V"; mkdir -p "$V/control"; cd "$V"
+echo "host $(hostname) start $(date -u +%FT%TZ) slots ${NSLOTS:-?}"
+cp $RUN/consensus/$S.fasta $S.fasta
+cmp $S.fasta $TW/$S.fasta
+python $T gff --gff $RUN/bakta/$S/$S.$EXT --fna $RUN/bakta/$S/$S.fna --consensus $S.fasta --out genes.gff --json genes_gff.json
+cmp genes.gff $TW/genes.gff
+mv $TW/reads.fastq reads.fastq
+cp $TW/subsample.json subsample.json
+cp $TW/phava/reads.fastq_vs_$S.fasta_ratio.tsv control/phava_ratio.tsv
+cp $TW/phava/Phava.log control/phava.log
+python $T annotate --ratio control/phava_ratio.tsv --consensus $S.fasta --gff $RUN/bakta/$S/$S.$EXT --fna $RUN/bakta/$S/$S.fna --sample $S --subsample-json subsample.json --phava-version 0.2.3 --out control/invertons.tsv --summary control/summary.tsv
+python $SP select --control control/invertons.tsv --genome $S.fasta --n 20 --seed 1 --min-forward 100 --min-seg 30 --max-seg 2000 --min-gap 10000 --out spiked.tsv
+python $SP edit --bam $RUN/mapping/$S/mapped.bam --fastq reads.fastq --spiked spiked.tsv --fractions 0.05,0.2,0.5 --seed 1 --spare 50 --out-prefix spiked_reads --truth truth.tsv
+echo "end $(date -u +%FT%TZ)"

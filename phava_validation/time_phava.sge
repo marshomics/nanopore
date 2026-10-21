@@ -1,0 +1,44 @@
+#!/bin/bash
+#$ -N phava_time
+#$ -j y
+#$ -cwd
+#$ -l h_vmem=4G
+#$ -pe parallel 8
+# usage: qsub time_phava.sge SAMPLE GFF_EXT DEPTH
+. ~/.bashrc
+mamba activate phava
+set -euo pipefail
+# numpy/OpenBLAS would reserve buffers for every core of the node and break h_vmem
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+command -v phava einverted minimap2
+S=$1; EXT=$2; DEPTH=$3
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+PW=/ebio/abt3_scratch/jmarsh/software/science/phava_build
+T=$PW/phava_tools.py
+W=$PW/timing/$S.d$DEPTH
+rm -rf "$W"; mkdir -p "$W"; cd "$W"
+echo "host $(hostname) start $(date -u +%FT%TZ) nslots ${NSLOTS:-?}"
+t0=$(date +%s)
+python $T gff --gff $RUN/bakta/$S/$S.$EXT --fna $RUN/bakta/$S/$S.fna --consensus $RUN/consensus/$S.fasta --out genes.gff
+t1=$(date +%s)
+python $T subsample --fastq $RUN/fastq_filtered/$S.fastq --genome $RUN/consensus/$S.fasta --max-depth $DEPTH --seed phava1 --out reads.fastq --json subsample.json
+t2=$(date +%s)
+cp $RUN/consensus/$S.fasta $S.fasta
+mkdir -p phava
+( while true; do echo "$(date +%s) $(du -sb phava 2>/dev/null | cut -f1) $(tail -n1 phava/Phava.log 2>/dev/null | tr -d '\t' | cut -c1-90)" >> monitor.log; sleep 20; done ) &
+MON=$!
+set +e
+/usr/bin/time -v phava variation_wf -i $S.fasta -r reads.fastq -d phava -t ${NSLOTS:-8} --genes genes.gff --genesFormat gff --reportAll > phava.stdout 2> phava.stderr
+rc=$?
+set -e
+t3=$(date +%s)
+kill $MON || true
+echo "phava exit $rc"
+[ $rc -eq 0 ] || { tail -30 phava.stderr; exit 1; }
+python $T annotate --ratio phava/reads.fastq_vs_$S.fasta_ratio.tsv --consensus $S.fasta --gff $RUN/bakta/$S/$S.$EXT --fna $RUN/bakta/$S/$S.fna --sample $S --subsample-json subsample.json --phava-version 0.2.3 --out invertons.tsv --summary summary.tsv
+t4=$(date +%s)
+echo "times gff=$((t1-t0)) subsample=$((t2-t1)) phava=$((t3-t2)) annotate=$((t4-t3))" | tee times.txt
+awk '{print $2}' monitor.log | sort -n | tail -1 > du_max.txt
+grep -E "Maximum resident|Elapsed|Percent of CPU" phava.stderr | tee -a times.txt
+ls -la . phava phava/intermediate phava/data
+echo "end $(date -u +%FT%TZ)"

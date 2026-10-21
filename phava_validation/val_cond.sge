@@ -1,0 +1,22 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_vmem=4G
+# usage: qsub val_cond.sge SAMPLE GFF_EXT FRACTION   (rule R4: one spiked condition)
+. ~/.bashrc
+mamba activate phava
+set -euo pipefail
+# numpy/OpenBLAS would reserve buffers for every core of the node and break h_vmem
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+S=$1; EXT=$2; F=$3
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+PW=/ebio/abt3_scratch/jmarsh/software/science/phava_build
+T=$PW/phava_tools.py
+V=$PW/val/$S; D=$V/f$F
+rm -rf "$D"; mkdir -p "$D"; cd "$D"
+echo "host $(hostname) start $(date -u +%FT%TZ) slots ${NSLOTS:-?}"
+ln -s ../spiked_reads.f$F.fastq $S.fastq
+phava variation_wf -i $V/$S.fasta -r $S.fastq -d phava -t ${NSLOTS:-4} --genes $V/genes.gff --genesFormat gff --reportAll > phava.stdout
+cp phava/$S.fastq_vs_$S.fasta_ratio.tsv phava_ratio.tsv
+python $T annotate --ratio phava_ratio.tsv --consensus $V/$S.fasta --gff $RUN/bakta/$S/$S.$EXT --fna $RUN/bakta/$S/$S.fna --sample $S --subsample-json $V/subsample.json --phava-version 0.2.3 --out invertons.tsv --summary summary.tsv
+echo "end $(date -u +%FT%TZ)"

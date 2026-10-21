@@ -1,0 +1,15 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_vmem=8G
+. ~/.bashrc
+mamba activate snv
+set -euo pipefail
+# numpy/OpenBLAS would reserve buffers for every core of the node and break h_vmem
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+PW=/ebio/abt3_scratch/jmarsh/software/science/phava_build
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+S=$1; FR=$2
+cd $PW/regeno
+python $PW/inv_regeno.py --bam $RUN/mapping/$S/mapped.bam --consensus $RUN/consensus/$S.fasta --invertons ids_$S.txt --fraction $FR --out regeno_$S.tsv
+echo done

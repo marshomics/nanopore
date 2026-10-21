@@ -1,0 +1,22 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_vmem=8G
+# usage: qsub geno_val.sge SAMPLE GFF_EXT CONDITION   (CONDITION: control | f0.05 | f0.2 | f0.5)
+# Re-count (phava_tools genotype) and re-annotate one validation condition from its PhaVa table.
+. ~/.bashrc
+mamba activate phava
+set -euo pipefail
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+S=$1; EXT=$2; K=$3
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+PW=/ebio/abt3_scratch/jmarsh/software/science/phava_build
+T=$PW/phava_tools.py
+V=$PW/val/$S; D=$V/$K
+if [ "$K" = control ]; then FQ=$V/reads.fastq; else FQ=$V/spiked_reads.$K.fastq; fi
+cd $D
+echo "host $(hostname) start $(date -u +%FT%TZ) reads $FQ"
+[ -s phava_ratio.tsv ] || cp phava/$S.fastq_vs_$S.fasta_ratio.tsv phava_ratio.tsv
+python $T genotype --ratio phava_ratio.tsv --consensus $V/$S.fasta --bam $RUN/mapping/$S/mapped.bam --fastq $FQ --subsample-json $V/subsample.json --threads ${NSLOTS:-1} --out genotype.tsv
+python $T annotate --ratio phava_ratio.tsv --consensus $V/$S.fasta --gff $RUN/bakta/$S/$S.$EXT --fna $RUN/bakta/$S/$S.fna --sample $S --subsample-json $V/subsample.json --genotype genotype.tsv --phava-version 0.2.3 --out invertons.tsv --summary summary.tsv
+echo "end $(date -u +%FT%TZ)"

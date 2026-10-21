@@ -1,0 +1,10 @@
+#!/bin/bash
+#$ -N bsv2_ovtest
+#$ -o /ebio/abt3_scratch/jmarsh/software/science/split_build/val/logs/bsv2_ovtest.log
+#$ -j y
+#$ -cwd
+#$ -l h_rt=1:0:0
+#$ -l h_vmem=16G
+#$ -pe parallel 1
+V=/ebio/abt3_scratch/jmarsh/software/science/split_build/val
+/tmp/global2/jmarsh/code/conda_envs/sv/bin/python $V/overlap_diffs.py $V/S3/basecalled/basecalls.bam $V/S1/basecalled/basecalls.bam $V/S1/basecalled/basecalls.bam > $V/results/p3_selftest_overlap.json; echo "rc=$?"

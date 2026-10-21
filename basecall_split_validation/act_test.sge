@@ -1,0 +1,10 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_rt=0:20:0
+#$ -l h_vmem=4G
+#$ -pe parallel 4
+# Same shell type and limits as s01b_merge_bam: does conda activation finish, with and without pinned BLAS threads?
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID ulimit_v=$(ulimit -v) nproc=$(nproc)"
+s=$(date +%s); ( export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1; timeout 300 bash -c '. ~/.bashrc >/dev/null 2>&1; mamba activate nanopore && echo ok' ); echo "pinned: rc=$? $(( $(date +%s) - s )) s"
+s=$(date +%s); ( timeout 300 bash -c '. ~/.bashrc >/dev/null 2>&1; mamba activate nanopore && echo ok' ); echo "unpinned: rc=$? $(( $(date +%s) - s )) s"

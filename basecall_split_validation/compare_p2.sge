@@ -1,0 +1,30 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -o /ebio/abt3_scratch/jmarsh/software/science/split_build/val/logs/bsv2_compare2.log
+#$ -l h_rt=4:0:0
+#$ -l h_vmem=12G
+#$ -pe parallel 2
+# Phase 2 comparisons: recovered (S3neg) and incremental (S3inc) merges against S1 and P; the positive
+# control for compare_bams.py; logs of every phase 2 run.
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+set -uo pipefail
+V=/ebio/abt3_scratch/jmarsh/software/science/split_build/val
+PY=/tmp/global2/jmarsh/code/conda_envs/sv/bin/python
+ST=/tmp/global2/jmarsh/code/conda_envs/nanopore/bin/samtools
+R=$V/results/p2; mkdir -p $R
+F4=PBM28996_eebc9374_9cc5eed7_77.pod5,PBM28996_eebc9374_9cc5eed7_80.pod5,PBM28996_eebc9374_9cc5eed7_81.pod5,PBM28996_eebc9374_9cc5eed7_82.pod5
+F5=PBM28996_eebc9374_9cc5eed7_79.pod5
+S1=$V/S1/basecalled/basecalls.bam
+$PY $V/compare_bams.py compare $V/S3neg/basecalled/basecalls.bam $S1 > $R/S3neg_vs_S1.json
+$PY $V/compare_bams.py compare $V/S3inc/basecalled/basecalls.bam $S1 --fn $F4 > $R/S3inc_vs_S1_4files.json
+$PY $V/compare_bams.py compare $V/S3inc/basecalled/basecalls.bam $V/P/P.bam --fn $F5 > $R/S3inc_vs_P_file79.json
+$PY $V/compare_bams.py summary $V/S3inc/basecalled/basecalls.bam > $R/S3inc_summary.json
+$PY $V/make_control.py $S1 $R/S1mod.bam && $PY $V/compare_bams.py compare $R/S1mod.bam $S1 > $R/control_S1mod_vs_S1.json
+rm -f $R/S1mod.bam
+for d in S3 S3neg S3inc S3size; do cp $V/$d/pipeline.log $R/${d}_pipeline.log; ls -la $V/$d/basecalled $V/$d/basecalled/chunks > $R/${d}_basecalled_ls.txt 2>&1; done
+cp $V/S3size/submit_scripts/s01_basecall_chunks.tsv $R/S3size_plan.tsv
+cp $V/S3inc/basecalled/chunks/summary.tsv $R/S3inc_chunk_summary.tsv 2>/dev/null
+$ST view -H $V/S3inc/basecalled/basecalls.bam > $R/S3inc_header.sam
+for id in $(awk -F'\t' '{print $2}' $V/jobs_p2.tsv); do qacct -j $id > $R/qacct_$id.txt 2>&1; done
+echo "done $(date -u +%FT%TZ)"

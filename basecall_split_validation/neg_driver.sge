@@ -1,0 +1,58 @@
+#!/bin/bash
+#$ -N bsv2_neg
+#$ -o /ebio/abt3_scratch/jmarsh/software/science/split_build/val/logs/bsv2_neg.log
+#$ -j y
+#$ -cwd
+#$ -l h_rt=4:0:0
+#$ -l h_vmem=4G
+#$ -pe parallel 4
+# Rule R5 criterion 5, CPU part. Runs the generated s01b_merge_bam.sh of pipelines S3neg and S3inc
+# directly (as SGE would) on copies of S3's finished chunks, one fault at a time:
+#   b  a chunk BAM is missing          -> FAIL, no basecalls.bam
+#   c  a pod5 file is not in the plan  -> FAIL, no basecalls.bam
+#   d  a chunk BAM is truncated        -> FAIL, no basecalls.bam, chunk moved to .bad, .done removed
+#   g1 S3inc: a fifth pod5 file is added -> FAIL; re-generate -> chunks 01-03 kept, chunk 04 added
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+set -u
+V=/ebio/abt3_scratch/jmarsh/software/science/split_build/val
+R=$V/results; mkdir -p $R
+POD5=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/20261008_1522_P2S-02398-A_PBM28996_eebc9374/pod5
+NPY=/tmp/global2/jmarsh/code/conda_envs/nanopore/bin/python
+GEN=/ebio/abt3_scratch/jmarsh/software/science/split_build/new_tree/generate_pipeline.py
+SHEET=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/20261008_1522_P2S-02398-A_PBM28996_eebc9374/samplesheet_template.txt
+OUT=$R/neg_tests.tsv
+printf 'test\trc\tbasecalls_bam\tevidence\n' > $OUT
+seed() {  # copy S3's finished chunks (same plan and settings, so the same chunk keys)
+  local d=$1/basecalled/chunks
+  mkdir -p $d && rm -f $d/chunk_* && cp $V/S3/basecalled/chunks/chunk_0[123].bam $V/S3/basecalled/chunks/chunk_0[123].done $d/
+}
+run_merge() {  # name dir
+  local name=$1 dir=$2 rc bam
+  bash $dir/submit_scripts/s01b_merge_bam.sh > $R/neg_$name.out 2>&1; rc=$?
+  [ -s $dir/basecalled/basecalls.bam ] && bam=present || bam=absent
+  printf '%s\t%s\t%s\t%s\n' "$name" "$rc" "$bam" "$(grep -E '\[(WARN|FAIL)\]' $R/neg_$name.out | head -3 | tr '\t\n' '  ')" >> $OUT
+}
+N=$V/S3neg
+seed $N
+rm -f $N/basecalled/chunks/chunk_02.bam
+run_merge b_missing_chunk $N
+seed $N
+ln -s $POD5/PBM28996_eebc9374_9cc5eed7_79.pod5 $V/pod5_neg/PBM28996_eebc9374_9cc5eed7_79.pod5
+run_merge c_unplanned_pod5 $N
+rm -f $V/pod5_neg/PBM28996_eebc9374_9cc5eed7_79.pod5
+seed $N
+sz=$(stat -c %s $N/basecalled/chunks/chunk_01.bam); truncate -s $((sz / 2)) $N/basecalled/chunks/chunk_01.bam
+run_merge d_truncated_chunk $N
+ls -la $N/basecalled/chunks/ > $R/neg_d_chunks_ls.txt
+[ -e $N/basecalled/chunks/chunk_01.bam.bad ] && [ ! -e $N/basecalled/chunks/chunk_01.done ] && echo "d_bad_moved_done_removed=yes" >> $R/neg_d_chunks_ls.txt
+# S3inc: incremental re-planning
+I=$V/S3inc
+seed $I
+ln -s $POD5/PBM28996_eebc9374_9cc5eed7_79.pod5 $V/pod5_inc/PBM28996_eebc9374_9cc5eed7_79.pod5
+run_merge g1_added_pod5 $I
+cp $I/submit_scripts/s01_basecall_chunks.tsv $R/inc_plan_before.tsv
+$NPY $GEN --pod5-dir $V/pod5_inc --samplesheet $SHEET --output-dir $I --config $V/cfg_S3neg.yaml > $R/inc_regenerate.log 2>&1; echo "regenerate_rc=$?" >> $R/inc_regenerate.log
+cp $I/submit_scripts/s01_basecall_chunks.tsv $R/inc_plan_after.tsv
+grep -E '^#\$ -t' $I/submit_scripts/s01_basecall.sh >> $R/inc_regenerate.log
+cat $OUT
+echo "done $(date -u +%FT%TZ)"

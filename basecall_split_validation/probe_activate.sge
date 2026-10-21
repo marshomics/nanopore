@@ -1,0 +1,16 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_rt=0:15:0
+#$ -l h_vmem=2G
+#$ -pe parallel 1
+# Where do the stage scripts stall on some nodes? Time each start-up step, each capped at 100 s.
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+t() { local s=$(date +%s.%N); timeout 100 bash -c "$1" > /dev/null 2>&1; local rc=$?; printf '%-28s rc=%s %.1f s\n' "$2" "$rc" "$(echo "$(date +%s.%N) - $s" | bc)"; }
+t '. ~/.bashrc' bashrc
+t '. ~/.bashrc; mamba activate nanopore' 'bashrc+mamba_activate'
+t '/ebio/abt3_projects/software/miniconda3/bin/conda shell.bash hook' conda_hook
+t 'ls /tmp/global2/jmarsh/code/conda_envs/nanopore/bin/samtools' ls_env
+t 'L=/ebio/abt3_scratch/jmarsh/software/science/split_build/val/S3/pipeline.log; ( flock -w 15 9; true ) 9>>"$L.lock"' flock_pipeline_log
+t 'df -h /tmp/global2 /ebio/abt3_scratch' df
+echo done

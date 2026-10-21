@@ -1,0 +1,31 @@
+#!/bin/bash
+#$ -N bsv2_cmpS1b
+#$ -o /ebio/abt3_scratch/jmarsh/software/science/split_build/val/logs/bsv2_cmpS1b.log
+#$ -j y
+#$ -cwd
+#$ -l h_rt=2:0:0
+#$ -l h_vmem=16G
+#$ -pe parallel 1
+# R5 criterion 2 control: the second single-job arm S1' against S1, plus descriptive comparisons
+# (S3 against S1', size of the S1'-S1 ML differences, overlap of the differing read sets).
+# Submitted with -hold_jid <S1' job id> on the command line (no embedded hold).
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+set -uo pipefail
+V=/ebio/abt3_scratch/jmarsh/software/science/split_build/val
+PY=/tmp/global2/jmarsh/code/conda_envs/sv/bin/python
+ST=/tmp/global2/jmarsh/code/conda_envs/nanopore/bin/samtools
+R=$V/results/p3; mkdir -p $R
+F4=PBM28996_eebc9374_9cc5eed7_77.pod5,PBM28996_eebc9374_9cc5eed7_80.pod5,PBM28996_eebc9374_9cc5eed7_81.pod5,PBM28996_eebc9374_9cc5eed7_82.pod5
+S1=$V/S1/basecalled/basecalls.bam; S1b=$V/S1b/basecalled/basecalls.bam; S3=$V/S3/basecalled/basecalls.bam
+cp $V/S1b/pipeline.log $R/S1b_pipeline.log
+ls -la $V/S1b/basecalled > $R/S1b_basecalled_ls.txt 2>&1
+if [ ! -s "$S1b" ] || ! grep -q "basecalls.bam written" $V/S1b/pipeline.log; then
+  echo "S1' did not finish: no basecalls.bam written" | tee $R/S1b_status.txt; exit 1
+fi
+if $ST quickcheck -u "$S1b"; then echo "S1b quickcheck -u ok" > $R/S1b_quickcheck.txt; else echo "S1b quickcheck -u FAILED rc=$?" > $R/S1b_quickcheck.txt; fi
+$PY $V/compare_bams.py compare $S1b $S1 > $V/results/S1b_vs_S1.json; echo "S1b_vs_S1 rc=$?"
+$PY $V/compare_bams.py compare $S3 $S1b > $R/S3_vs_S1b.json; echo "S3_vs_S1b rc=$?"
+$PY $V/inspect_diffs.py $S1b $S1 $V/P/P.bam $F4 > $R/S1b_inspect.json; echo "inspect rc=$?"
+$PY $V/overlap_diffs.py $S3 $S1 $S1b > $R/diff_overlap.json; echo "overlap rc=$?"
+qacct -j 6270173 > $R/qacct_6270173.txt 2>&1
+echo "done $(date -u +%FT%TZ)"

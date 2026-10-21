@@ -1,0 +1,22 @@
+#!/bin/bash
+#$ -N bsv_prod
+#$ -o /ebio/abt3_scratch/jmarsh/software/science/split_build/val/logs/bsv_prod.log
+#$ -j y
+#$ -cwd
+#$ -l h_rt=6:0:0
+#$ -l h_vmem=2G
+#$ -pe parallel 4
+# Arm P of rule R5: the production single-job records of the five test pod5 files (fn tag).
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+set -euo pipefail
+ST=/tmp/global2/jmarsh/code/conda_envs/nanopore/bin/samtools
+BAM=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output/basecalled/basecalls.bam
+V=/ebio/abt3_scratch/jmarsh/software/science/split_build/val
+mkdir -p $V/P
+EXPR='[fn]=="PBM28996_eebc9374_9cc5eed7_77.pod5" || [fn]=="PBM28996_eebc9374_9cc5eed7_80.pod5" || [fn]=="PBM28996_eebc9374_9cc5eed7_81.pod5" || [fn]=="PBM28996_eebc9374_9cc5eed7_82.pod5" || [fn]=="PBM28996_eebc9374_9cc5eed7_79.pod5"'
+$ST view -@ 4 -b -e "$EXPR" -o $V/P/P.partial.bam $BAM
+$ST quickcheck -u $V/P/P.partial.bam
+mv $V/P/P.partial.bam $V/P/P.bam
+$ST view -@ 4 $V/P/P.bam | awk -F'\t' '{for (i = 12; i <= NF; i++) if ($i ~ /^fn:Z:/) { print substr($i, 6); break }}' | sort | uniq -c > $V/P/P_fn_counts.txt
+cat $V/P/P_fn_counts.txt
+echo "done $(date -u +%FT%TZ)"

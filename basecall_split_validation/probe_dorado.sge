@@ -1,0 +1,28 @@
+#!/bin/bash
+#$ -j y
+#$ -cwd
+#$ -l h_rt=1:0:0
+#$ -l gpu=1
+#$ -l gpumem=12G
+#$ -pe parallel 4
+# Why did dorado fail on the TITAN Xp nodes? Basecall 3,000 reads of one small pod5 file with the run's
+# settings; run with different h_vmem and on different card types (qsub -l h_vmem=... -q ...).
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+echo "ulimit -v (kB): $(ulimit -v)"
+nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv,noheader 2>&1 | paste -sd ';' -
+. ~/.bashrc >/dev/null 2>&1; mamba activate nanopore
+CUDA_DIR=/ebio/abt3_projects/software
+export PATH=$PATH:$CUDA_DIR/cuda-11.7/bin
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/run/nvidia:$CUDA_DIR/cuda-11.7/lib64:$CUDA_DIR/cuda-11.7/extras/CUPTI/lib64:$CUDA_DIR/cuda-drivers
+M=/ebio/abt3_projects2/Gut_nanopore/data/models
+OUT=/ebio/abt3_scratch/jmarsh/software/science/split_build/val/probe/$JOB_NAME.bam
+mkdir -p $(dirname $OUT)
+t0=$(date +%s)
+/ebio/abt3_scratch/jmarsh/software/dorado_212/dorado-2.1.2-linux-x64/bin/dorado basecaller $M/dna_r10.4.1_e8.2_400bps_sup@v5.2.0 \
+  /ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/20261008_1522_P2S-02398-A_PBM28996_eebc9374/pod5/PBM28996_eebc9374_9cc5eed7_80.pod5 \
+  --modified-bases-models $M/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_4mC_5mC@v1,$M/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_6mA@v1 \
+  --kit-name SQK-NBD114-24 --max-reads 3000 > $OUT 2> $OUT.err
+rc=$?
+echo "dorado rc=$rc seconds=$(( $(date +%s) - t0 )) bytes=$(stat -c %s $OUT)"
+grep -m3 -E '\[error\]|out of memory' $OUT.err || true
+/tmp/global2/jmarsh/code/conda_envs/nanopore/bin/samtools view -c $OUT 2>/dev/null | sed 's/^/records=/'

@@ -1,0 +1,32 @@
+#!/bin/bash
+#$ -N bsv_compare
+#$ -o /ebio/abt3_scratch/jmarsh/software/science/split_build/val/logs/bsv_compare.log
+#$ -j y
+#$ -cwd
+#$ -l h_rt=6:0:0
+#$ -l h_vmem=12G
+#$ -pe parallel 2
+# Rule R5 criteria 1-4 and the P reference: compare arms S3, S1 and P, check the merged file and demux.
+echo "running on: $(hostname) slots=$NSLOTS jobid=$JOB_ID"
+set -uo pipefail
+V=/ebio/abt3_scratch/jmarsh/software/science/split_build/val
+PY=/tmp/global2/jmarsh/code/conda_envs/sv/bin/python
+ST=/tmp/global2/jmarsh/code/conda_envs/nanopore/bin/samtools
+R=$V/results; mkdir -p $R
+F4=PBM28996_eebc9374_9cc5eed7_77.pod5,PBM28996_eebc9374_9cc5eed7_80.pod5,PBM28996_eebc9374_9cc5eed7_81.pod5,PBM28996_eebc9374_9cc5eed7_82.pod5
+S1=$V/S1/basecalled/basecalls.bam; S3=$V/S3/basecalled/basecalls.bam
+$PY -c 'import pysam' || exit 3
+for f in $S1 $S3 $V/P/P.bam; do $ST quickcheck -u $f && echo "quickcheck ok $f" || echo "quickcheck FAILED $f"; done > $R/quickcheck.txt
+$ST view -H $S3 > $R/S3_header.sam; $ST view -H $S1 > $R/S1_header.sam
+$PY $V/compare_bams.py compare $S3 $S1 > $R/S3_vs_S1.json
+$PY $V/compare_bams.py compare $S3 $V/P/P.bam --fn $F4 > $R/S3_vs_P.json
+$PY $V/compare_bams.py compare $S1 $V/P/P.bam --fn $F4 > $R/S1_vs_P.json
+$PY $V/compare_bams.py summary $V/S3/basecalled/chunks/chunk_01.bam $V/S3/basecalled/chunks/chunk_02.bam $V/S3/basecalled/chunks/chunk_03.bam > $R/S3_chunks.json
+$PY $V/demux_compare.py $V/S3 $V/S1 > $R/demux_S3_vs_S1.json
+cp $V/S3/basecalled/chunks/summary.tsv $R/S3_chunk_summary.tsv
+cp $V/S3/basecalled/chunks/merged_header.sam $R/S3_merged_header.sam
+for d in S1 S3; do cp $V/$d/pipeline.log $R/${d}_pipeline.log; done
+cp $V/S3/basecalled/chunks/chunk_0*.done $R/ 2>/dev/null
+for id in $(awk -F'\t' '{print $2}' $V/jobs.tsv); do qacct -j $id > $R/qacct_$id.txt 2>&1; done
+ls -la $V/S1/basecalled $V/S3/basecalled $V/S3/basecalled/chunks > $R/basecalled_ls.txt
+echo "done $(date -u +%FT%TZ)"

@@ -1,0 +1,15 @@
+#!/bin/bash
+#$ -N snvagg
+#$ -cwd
+#$ -j y
+#$ -l h_vmem=4G
+#$ -l h_rt=4:0:0
+#$ -pe parallel 8
+# Aggregate one validation into its evidence folder: WHAT=polval|snvval|minval, OUT=folder
+. ~/.bashrc >/dev/null 2>&1; mamba activate snv
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TERM=dumb
+set -euo pipefail
+S=/ebio/abt3_scratch/jmarsh/software/science/snv_build
+rm -rf "${OUT:?}"
+python $S/bin/val_aggregate.py "${WHAT:?}" --out "$OUT"
+echo "AGG_DONE $WHAT"

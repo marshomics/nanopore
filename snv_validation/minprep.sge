@@ -1,0 +1,33 @@
+#!/bin/bash
+#$ -N snvminprep
+#$ -cwd
+#$ -j y
+#$ -l h_vmem=6G
+#$ -l h_rt=12:0:0
+#$ -pe parallel 16
+#$ -t 1-2
+# Rule R3 preparation: all filtered reads mapped to the polished genome exactly as in s13
+# (minimap2 -ax map-ont), the repeat mask and the spike-in sites.
+. ~/.bashrc >/dev/null 2>&1; mamba activate snv
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TERM=dumb
+set -euo pipefail
+S=/ebio/abt3_scratch/jmarsh/software/science/snv_build
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+TDEPTH=${TDEPTH:?set TDEPTH}
+samples=(Cminuta01 Tube14_T002_conj)
+s=${samples[$((SGE_TASK_ID-1))]}
+W=$S/minval/$s; mkdir -p "$W"; cd "$W"
+T=${NSLOTS:-16}
+log(){ echo "[$(date -u +%FT%TZ)] $s $*"; }
+[ -s T.fasta ] || cp "$S/polval/$s/polished_d$TDEPTH.fasta" T.fasta
+if [ ! -s full.bam.bai ]; then
+  minimap2 -ax map-ont -t $T T.fasta "$RUN/fastq_filtered/$s.fastq" 2> full.mm2.log | samtools sort -@ 8 -m 2G -o full.bam -
+  samtools index full.bam
+fi
+[ -s full.bases ] || samtools stats -@ 8 full.bam | awk -F'\t' '$2=="bases mapped (cigar):" {print $3}' > full.bases
+G=$(grep -v '>' T.fasta | tr -d '\n' | wc -c)
+echo "$(cat full.bases) $G" | awk '{printf "%.1f\n", $1/$2}' > full.depth
+log "full depth $(cat full.depth)x"
+[ -s T.repeats.bed ] || python $S/bin/snv_tools.py repeats --genome T.fasta --out T.repeats.bed
+[ -s sites.tsv ] || python $S/bin/spike_minor.py sites --ref T.fasta --repeats T.repeats.bed --bam full.bam --out sites.tsv --seed $(( 200 + SGE_TASK_ID ))
+log "sites: $(awk 'NR>1 {print $5}' sites.tsv | sort | uniq -c | tr '\n' ' ')"

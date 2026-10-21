@@ -1,0 +1,27 @@
+#!/bin/bash
+#$ -N snvminone
+#$ -cwd
+#$ -j y
+#$ -l h_vmem=8G
+#$ -l h_rt=24:0:0
+#$ -pe parallel 2
+# One spike-in fraction of one (sample, depth) condition: identical commands, seeds and inputs to
+# minval.sge, so the output equals what minval.sge produces for that fraction. S, D, F via qsub -v.
+. ~/.bashrc >/dev/null 2>&1; mamba activate snv
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TERM=dumb
+set -euo pipefail
+S_=/ebio/abt3_scratch/jmarsh/software/science/snv_build
+s=${S:?}; D=${D:?}; f=${F:?}
+W=$S_/minval/$s; cd "$W"
+base=d$D.bam; [ -s $base.bai ] || base=full.bam
+TMP=$(mktemp -d "$W/tmp.d$D.f$f.XXXXXX")
+o=out/f${f}_d$D
+if [ ! -s $o/summary.tsv ]; then
+  rm -rf $o
+  python $S_/bin/spike_minor.py spike --bam $base --sites sites.tsv --fraction $f --seed spike_${s}_$D \
+      --out-bam $TMP/sp.bam --out-truth $o.truth.tsv > $o.spike.log
+  python $S_/bin/minor_variants.py call --bam $TMP/sp.bam --ref T.fasta --repeats T.repeats.bed --sample "$s" --outdir "$o" > "$o.log" 2>&1 \
+    || { tail -20 "$o.log"; exit 1; }
+fi
+rm -rf "$TMP"
+echo "[$(date -u +%FT%TZ)] $s d$D f=$f: $(awk -F'\t' 'NR==2 {print "sites "$7", called "$8}' $o/summary.tsv)"

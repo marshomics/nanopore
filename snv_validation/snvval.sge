@@ -1,0 +1,75 @@
+#!/bin/bash
+#$ -N snvval
+#$ -cwd
+#$ -j y
+#$ -l h_vmem=6G
+#$ -l h_rt=24:0:0
+#$ -pe parallel 16
+#$ -t 1-4
+# Rule R2 caller validation for one sample per task: mutated reference from the sample's
+# polished genome (T), real reads at 10/25/50/100x mapped to it, five caller configurations,
+# vcfdist scoring against the R->T truth. TDEPTH selects the polished state used as T.
+. ~/.bashrc >/dev/null 2>&1; mamba activate snv
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TERM=dumb
+set -euo pipefail
+S=/ebio/abt3_scratch/jmarsh/software/science/snv_build
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+DOR=/ebio/abt3_scratch/jmarsh/software/dorado_212/dorado-2.1.2-linux-x64/bin/dorado
+MD=/ebio/abt3_projects2/Gut_nanopore/data/models
+CL3=/tmp/global2/jmarsh/code/conda_envs/clair3
+MODEL=/tmp/global2/jmarsh/code/conda_envs/clair3_models/r1041_e82_400bps_sup_v520
+PT=$S/bin/polish_tools.py; ST=$S/bin/snv_tools.py
+TDEPTH=${TDEPTH:?set TDEPTH}
+samples=(Cminuta01 Cminuta02 Tube14_T002_conj Tube15_T002_conj)
+s=${samples[$((SGE_TASK_ID-1))]}
+W=$S/snvval/$s; mkdir -p "$W"; cd "$W"
+T=${NSLOTS:-16}
+t0=$(date +%s); log(){ echo "[$(date -u +%FT%TZ) +$(( $(date +%s) - t0 ))s] $s $*"; }
+log "node $(hostname) slots $T; truth genome = polished_d$TDEPTH"
+[ -s T.fasta ] || cp "$S/polval/$s/polished_d$TDEPTH.fasta" T.fasta
+[ -s T.repeats.bed ] || python $ST repeats --genome T.fasta --out T.repeats.bed
+[ -s R.fasta ] || python $ST mutate --genome T.fasta --repeats T.repeats.bed --out-ref R.fasta --out-truth truth.raw.vcf \
+    --out-bed conf.bed --snps 1500 --indels 300 --repeat-frac 0.10 --seed $(( 100 + SGE_TASK_ID ))
+[ -s R.fasta.fai ] || samtools faidx R.fasta
+[ -s R.repeats.bed ] || python $ST repeats --genome R.fasta --out R.repeats.bed
+[ -s truth.vcf ] || bcftools norm -f R.fasta -c x -O v -o truth.vcf truth.raw.vcf
+log "truth records $(grep -vc '^#' truth.vcf)"
+[ -s sub.subsample.json ] || python $PT subsample --fastq "$RUN/fastq_filtered/$s.fastq" --stats "$S/polval/$s/stats.json" \
+    --draft T.fasta --depths 10,25,50,100 --seed snv1 --prefix sub
+python $PT rgheader --stats "$S/polval/$s/stats.json" --sample "$s" --out rg.txt
+align(){ # reads ref out.bam
+  minimap2 -ax lr:hq -y -t $T "$2" "$1" 2> "$3.mm2.log" | samtools view -b -o "$3.u.bam" -
+  { samtools view -H "$3.u.bam" | awk '!/^@RG/'; cat rg.txt; } > "$3.hdr"
+  samtools reheader "$3.hdr" "$3.u.bam" | samtools sort -@ 4 -m 1G -o "$3" -
+  samtools index "$3"; rm -f "$3.u.bam" "$3.hdr"
+}
+clair3(){ # bam ref outprefix extra-flags... -> outprefix.vcf
+  local b=$1 r=$2 o=$3; shift 3
+  [ -s "$o.vcf" ] && return 0
+  env PATH=$CL3/bin:$PATH CONDA_PREFIX=$CL3 run_clair3.sh -b "$b" -f "$r" -m $MODEL -t $T -p ont -o "$o" \
+      --include_all_ctgs --no_phasing_for_fa "$@" > "$o.log" 2>&1 || { tail -20 "$o.log"; return 1; }
+  zcat "$o/merge_output.vcf.gz" > "$o.vcf"; rm -rf "$o"
+}
+norm(){ bcftools norm -f R.fasta -m -any -c x -O v "$1" 2>/dev/null | bcftools sort -O v -o "$2" 2>/dev/null; }
+for d in 10 25 50 100; do
+  [ -s aln_d$d.bam.bai ] || align sub.d$d.fastq R.fasta aln_d$d.bam
+  clair3 aln_d$d.bam R.fasta c3p_d$d --haploid_precise
+  clair3 aln_d$d.bam R.fasta c3d_d$d
+  if [ ! -s dp_d$d/variants.vcf ]; then
+    "$DOR" polish aln_d$d.bam R.fasta --bacteria --models-directory "$MD" -x cpu -t $T -o dp_d$d --vcf --any-bam > dp_d$d.log 2>&1 \
+      || { tail -20 dp_d$d.log; exit 3; }
+  fi
+  python $ST pass --vcf c3p_d$d.vcf --out q_C3P_d$d.raw.vcf > /dev/null
+  python $ST af-filter --vcf c3d_d$d.vcf --out q_C3AF_d$d.raw.vcf --af 0.65 > /dev/null
+  python $ST pass --vcf dp_d$d/variants.vcf --out q_DP_d$d.raw.vcf > /dev/null
+  for cf in C3P C3AF DP; do norm q_${cf}_d$d.raw.vcf q_${cf}_d$d.vcf; done
+  python $ST combine --a q_C3AF_d$d.vcf --b q_DP_d$d.vcf --mode int --out q_INT_d$d.vcf > /dev/null
+  python $ST combine --a q_C3AF_d$d.vcf --b q_DP_d$d.vcf --mode uni --out q_UNI_d$d.vcf > /dev/null
+  for cf in C3P C3AF DP INT UNI; do
+    mkdir -p vd_${cf}_d$d
+    [ -s vd_${cf}_d$d/precision-recall-summary.tsv ] || vcfdist q_${cf}_d$d.vcf truth.vcf R.fasta -b conf.bed \
+        -p vd_${cf}_d$d/ -t $T -r 8 > vd_${cf}_d$d.log 2>&1 || { tail -5 vd_${cf}_d$d.log; exit 4; }
+    log "d$d $cf: $(awk -F'\t' '$1=="ALL" && $2=="NONE" {print "TP "$4" FN "$6" FP "$7" F1 "$10}' vd_${cf}_d$d/precision-recall-summary.tsv)"
+  done
+done
+log "DONE"

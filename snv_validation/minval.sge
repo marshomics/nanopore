@@ -1,0 +1,48 @@
+#!/bin/bash
+#$ -N snvminval
+#$ -cwd
+#$ -j y
+#$ -l h_vmem=8G
+#$ -l h_rt=48:0:0
+#$ -pe parallel 8
+#$ -t 1-6
+# Rule R3 validation: one (sample, depth) per task; the unmodified control plus 8 spike-in
+# fractions, each analysed by the production engine with its default settings.
+. ~/.bashrc >/dev/null 2>&1; mamba activate snv
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TERM=dumb
+set -euo pipefail
+S=/ebio/abt3_scratch/jmarsh/software/science/snv_build
+samples=(Cminuta01 Cminuta01 Cminuta01 Tube14_T002_conj Tube14_T002_conj Tube14_T002_conj)
+depths=(100 500 2000 100 500 2000)
+s=${samples[$((SGE_TASK_ID-1))]}; D=${depths[$((SGE_TASK_ID-1))]}
+W=$S/minval/$s; cd "$W"
+TMP=$(mktemp -d "$W/tmp.d$D.XXXXXX")
+log(){ echo "[$(date -u +%FT%TZ)] $s d$D $*"; }
+full=$(cat full.depth)
+frac=$(awk -v d=$D -v f=$full 'BEGIN { x = d / f; if (x >= 1) x = 1; printf "%.6f", x }')
+if awk -v x=$frac 'BEGIN { exit !(x >= 1) }'; then base=full.bam
+else
+  base=d$D.bam
+  [ -s $base.bai ] || { samtools view -@ 4 -b -s "7$(echo $frac | sed 's/^0//')" -o $base full.bam; samtools index $base; }
+fi
+log "base BAM $base (fraction $frac of ${full}x)"
+eng(){ # bam outdir
+  [ -s "$2/summary.tsv" ] && return 0
+  python $S/bin/minor_variants.py call --bam "$1" --ref T.fasta --repeats T.repeats.bed --sample "$s" --outdir "$2" > "$2.log" 2>&1 \
+    || { tail -20 "$2.log"; return 1; }
+}
+mkdir -p out
+eng $base out/ctrl_d$D
+log "control: $(awk -F'\t' 'NR==2 {print "sites "$7", called "$8", median depth "$6}' out/ctrl_d$D/summary.tsv)"
+for f in 0.0025 0.005 0.01 0.02 0.05 0.10 0.20 0.40; do
+  o=out/f${f}_d$D
+  if [ ! -s $o/summary.tsv ]; then
+    python $S/bin/spike_minor.py spike --bam $base --sites sites.tsv --fraction $f --seed spike_${s}_$D \
+        --out-bam $TMP/sp.bam --out-truth $o.truth.tsv > $o.spike.log
+    eng $TMP/sp.bam $o
+    rm -f $TMP/sp.bam $TMP/sp.bam.bai
+  fi
+  log "f=$f: $(awk -F'\t' 'NR==2 {print "sites "$7", called "$8}' $o/summary.tsv)"
+done
+rm -rf "$TMP"
+log DONE

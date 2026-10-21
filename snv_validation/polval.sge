@@ -1,0 +1,78 @@
+#!/bin/bash
+#$ -N snvpolval
+#$ -cwd
+#$ -j y
+#$ -l h_vmem=6G
+#$ -l h_rt=24:0:0
+#$ -pe parallel 16
+#$ -t 1-4
+# Polishing validation (rule R1) for one run sample per task: polish at 50/100/200/400x,
+# hold-out Clair3 calls for every state, differences to the independent reference,
+# injected-error recovery at every depth.
+. ~/.bashrc >/dev/null 2>&1; mamba activate snv
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TERM=dumb
+set -euo pipefail
+S=/ebio/abt3_scratch/jmarsh/software/science/snv_build
+RUN=/ebio/abt3_scratch/jmarsh/nanopore/20261012_cm_conjugation/no_sample_id/output
+DOR=/ebio/abt3_scratch/jmarsh/software/dorado_212/dorado-2.1.2-linux-x64/bin/dorado
+MD=/ebio/abt3_projects2/Gut_nanopore/data/models
+CL3=/tmp/global2/jmarsh/code/conda_envs/clair3
+MODEL=/tmp/global2/jmarsh/code/conda_envs/clair3_models/r1041_e82_400bps_sup_v520
+PT=$S/bin/polish_tools.py
+samples=(Cminuta01 Cminuta02 Tube14_T002_conj Tube15_T002_conj)
+s=${samples[$((SGE_TASK_ID-1))]}
+case $s in Cminuta*) REF=$S/refs/NZ_CP029256.fasta ;; *) REF=$S/refs/T002_i2.fasta ;; esac
+W=$S/polval/$s; mkdir -p "$W"; cd "$W"
+T=${NSLOTS:-16}
+t0=$(date +%s); log(){ echo "[$(date -u +%FT%TZ) +$(( $(date +%s) - t0 ))s] $s $*"; }
+log "node $(hostname) slots $T ref $REF"
+[ -s draft.fasta ] || cp "$RUN/consensus/$s.fasta" draft.fasta
+[ -s stats.json ] || python $PT stats --fastq "$RUN/fastq_filtered/$s.fastq" --out stats.json
+[ -s sub.subsample.json ] || python $PT subsample --fastq "$RUN/fastq_filtered/$s.fastq" --stats stats.json \
+    --draft draft.fasta --depths 50,100,200,400 --holdout-depth 100 --seed polish1 --prefix sub
+python $PT rgheader --stats stats.json --sample "$s" --out rg.txt
+log "subsamples: $(tr -d '\n ' < sub.subsample.json | grep -o '"depth":[0-9.]*' | tr '\n' ' ')"
+align(){ # reads ref out.bam
+  minimap2 -ax lr:hq -y -t $T "$2" "$1" 2> "$3.mm2.log" | samtools view -b -o "$3.u.bam" -
+  { samtools view -H "$3.u.bam" | awk '!/^@RG/'; cat rg.txt; } > "$3.hdr"
+  samtools reheader "$3.hdr" "$3.u.bam" | samtools sort -@ 4 -m 1G -o "$3" -
+  samtools index "$3"; rm -f "$3.u.bam" "$3.hdr"
+}
+polish(){ # bam draft outdir
+  [ -s "$3/consensus.fasta" ] && return 0
+  "$DOR" polish "$1" "$2" --bacteria --models-directory "$MD" -x cpu -t $T -o "$3" --vcf --any-bam > "$3.log" 2>&1 \
+    || { tail -20 "$3.log"; return 1; }
+}
+clair3(){ # bam ref outdir -> vcf (plain)
+  [ -s "$3.vcf" ] && return 0
+  [ -s "$2.fai" ] || samtools faidx "$2"
+  env PATH=$CL3/bin:$PATH CONDA_PREFIX=$CL3 run_clair3.sh -b "$1" -f "$2" -m $MODEL -t $T -p ont -o "$3" \
+      --include_all_ctgs --haploid_precise --no_phasing_for_fa > "$3.log" 2>&1 || { tail -20 "$3.log"; return 1; }
+  zcat "$3/merge_output.vcf.gz" > "$3.vcf"; rm -rf "$3"
+}
+for d in 50 100 200 400; do
+  [ -s aln_d$d.bam.bai ] || align sub.d$d.fastq draft.fasta aln_d$d.bam
+  polish aln_d$d.bam draft.fasta pol_d$d
+  cp pol_d$d/consensus.fasta polished_d$d.fasta
+  [ -s changes_d$d.tsv ] || python $PT changes --draft draft.fasta --polished polished_d$d.fasta --bam aln_d$d.bam --vcf pol_d$d/variants.vcf --out changes_d$d.tsv
+  log "polished d$d: $(( $(wc -l < changes_d$d.tsv) - 1 )) changes"
+done
+for x in draft d50 d100 d200 d400; do
+  ref=draft.fasta; [ $x = draft ] || ref=polished_$x.fasta
+  [ -s ho_$x.bam.bai ] || align sub.holdout.fastq $ref ho_$x.bam
+  clair3 ho_$x.bam $ref c3_ho_$x
+  [ -s dref_$x.tsv ] || python $PT diff --query $ref --ref "$REF" --out dref_$x.tsv --threads $T
+  log "state $x: hold-out PASS $(awk '!/^#/ && $7=="PASS"' c3_ho_$x.vcf | wc -l); Dref $(cat dref_$x.tsv.json)"
+  rm -f ho_$x.bam ho_$x.bam.bai
+done
+for d in 50 100 200 400; do
+  [ -s inj_d$d.fasta ] || python $PT inject --genome polished_d$d.fasta --out-fasta inj_d$d.fasta \
+      --out-truth inj_d$d.truth.tsv --seed $(( 1000 + d + SGE_TASK_ID ))
+  [ -s injaln_d$d.bam.bai ] || align sub.d$d.fastq inj_d$d.fasta injaln_d$d.bam
+  polish injaln_d$d.bam inj_d$d.fasta injpol_d$d
+  [ -s injdiff_d$d.tsv ] || python $PT diff --query injpol_d$d/consensus.fasta --ref polished_d$d.fasta --out injdiff_d$d.tsv --threads $T
+  python $PT assess --truth inj_d$d.truth.tsv --diff injdiff_d$d.tsv --out inj_d$d.assess.tsv --out-new inj_d$d.new.tsv > inj_d$d.assess.json
+  log "injection d$d: $(cat inj_d$d.assess.json)"
+  rm -f injaln_d$d.bam injaln_d$d.bam.bai
+done
+log "DONE"

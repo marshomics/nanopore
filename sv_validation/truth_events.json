@@ -1,0 +1,32 @@
+[
+ {
+  "event": "DEL6527",
+  "type": "DEL",
+  "base": "T002_i2",
+  "alt": "T002_i2_with_deletion",
+  "start": 985466,
+  "end": 991992,
+  "length": 6527,
+  "note": "user-supplied pair; exact deletion, no flanking homology"
+ },
+ {
+  "event": "INV3000",
+  "type": "INV",
+  "base": "T002_i2",
+  "alt": "T002_i2_inv3k",
+  "start": 400001,
+  "end": 403000,
+  "length": 3000,
+  "note": "synthetic inversion, no flanking inverted repeats"
+ },
+ {
+  "event": "DUP5000",
+  "type": "DUP",
+  "base": "T002_i2",
+  "alt": "T002_i2_dup5k",
+  "start": 1400001,
+  "end": 1405000,
+  "length": 5000,
+  "note": "synthetic tandem duplication (copy inserted after position 1405000)"
+ }
+]

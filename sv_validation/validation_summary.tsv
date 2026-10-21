@@ -1,0 +1,11 @@
+event	depth	conditions	median_spanning_reads	spanning_MAE_pp_5to95	spanning_bias_pp_5to95	spanning_max_err_pp_5to95	spanning_CI_covers_truth	junction_MAE_pp_5to95	junction_bias_pp_5to95	junction_CI_covers_truth	lowest_fraction_called_mixture	mixtures_called	false_mixture_calls_in_pure	reads_misassigned	discovery_reported_5to95	discovery_MAE_pp_5to95	false_discovered_calls	median_runtime_s
+DEL (consensus A)	100	12	40	4.17	1.19	9.31	10/10	2.45	-0.29	10/10	10%	5/10	0	0/505	6/7	4.02	0	63
+DEL (consensus A)	400	12	175	0.82	-0.15	1.53	10/10	0.77	-0.37	10/10	5%	8/10	0	0/2080	7/7	0.82	0	224
+DEL (consensus A)	1000	12	432	1.07	-0.73	3.07	10/10	0.7	-0.61	10/10	2%	9/10	0	0/5144	7/7	1.07	0	714
+DEL (consensus B)	100	12	40	4.17	1.19	9.33	10/10	2.45	-0.29	10/10	10%	5/10	0	0/501	6/7	4.37	0	90
+DEL (consensus B)	400	12	175	0.88	-0.16	1.8	10/10	0.75	-0.36	10/10	5%	8/10	0	0/2072	7/7	0.88	0	380
+DEL (consensus B)	1000	12	431	1.1	-0.7	3.21	10/10	0.72	-0.6	10/10	2%	9/10	0	0/5126	7/7	1.1	0	972
+DUP	100	12	31	3.73	3.38	9.39	10/10	2.97	0.77	10/10	25%	3/10	0	0/358	5/7	4.87	0	92
+DUP	400	12	123	1.77	-1.02	6.61	10/10	1.72	-0.33	10/10	5%	6/10	0	0/1424	7/7	1.66	0	545
+INV	100	12	65	1.8	-1.16	2.66	10/10	1.8	-0.95	10/10	10%	6/10	0	0/770	6/7	1.91	0	120
+INV	400	12	251	0.78	-0.29	1.15	10/10	0.71	-0.59	10/10	2%	9/10	0	0/3030	7/7	0.78	0	430
